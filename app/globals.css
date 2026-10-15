@@ -1,0 +1,101 @@
+@import "tailwindcss";
+
+/* ------------------------------------------------------------------
+   Blue Market Ads — design tokens
+   Palette: harbor navy for structure, market blue for action, brass
+   for the one thing on a screen that needs attention. Charts draw from
+   the same family so every page reads as one system.
+   Type: Archivo throughout, using its width axis — expanded for
+   headings and the wordmark, condensed for figures.
+   ------------------------------------------------------------------ */
+
+@theme {
+  --font-sans: var(--font-archivo), ui-sans-serif, system-ui, sans-serif;
+
+  --color-ink: #0e1e33;
+  --color-ink-2: #3c4d63;
+  --color-ink-3: #6b7a8e;
+  --color-harbor: #10294a;
+  --color-harbor-2: #183a63;
+  --color-market: #1f5fad;
+  --color-market-2: #174c8c;
+  --color-sky: #6fa3db;
+  --color-mist: #e4ecf6;
+  --color-paper: #f3f6fa;
+  --color-line: #dbe3ee;
+  --color-brass: #b8862b;
+  --color-brass-soft: #f6ecd8;
+  --color-good: #2e7d5b;
+  --color-good-soft: #e3f1ea;
+  --color-bad: #b4442e;
+  --color-bad-soft: #f8e6e1;
+
+  --radius-ctl: 6px;
+  --radius-panel: 10px;
+}
+
+@layer base {
+  html { background: var(--color-paper); color: var(--color-ink); }
+  body {
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 1.5;
+    font-variation-settings: "wdth" 100;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: #cfe0f5; }
+  :focus-visible { outline: 2px solid var(--color-market); outline-offset: 2px; border-radius: 4px; }
+}
+
+@layer components {
+  /* Expanded width for headings: the brand voice */
+  .t-display { font-variation-settings: "wdth" 118; font-weight: 640; letter-spacing: -0.015em; }
+  .t-title { font-variation-settings: "wdth" 112; font-weight: 620; letter-spacing: -0.01em; }
+  /* Condensed width for figures: dense, tabular, easy to scan */
+  .t-figure { font-variation-settings: "wdth" 78; font-weight: 600; font-feature-settings: "tnum" 1; letter-spacing: -0.01em; }
+  .tnum { font-feature-settings: "tnum" 1; }
+
+  .panel { background: #fff; border: 1px solid var(--color-line); border-radius: var(--radius-panel); }
+
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    height: 36px; padding: 0 14px; border-radius: var(--radius-ctl);
+    font-weight: 560; font-size: 13.5px; transition: background-color .15s, border-color .15s, color .15s;
+    white-space: nowrap;
+  }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn-primary { background: var(--color-market); color: #fff; }
+  .btn-primary:hover:not(:disabled) { background: var(--color-market-2); }
+  .btn-quiet { background: #fff; color: var(--color-ink); border: 1px solid var(--color-line); }
+  .btn-quiet:hover:not(:disabled) { border-color: #b9c7d9; background: #fafcfe; }
+  .btn-ghost { color: var(--color-ink-2); }
+  .btn-ghost:hover:not(:disabled) { background: var(--color-mist); color: var(--color-ink); }
+
+  .field {
+    width: 100%; height: 42px; padding: 0 12px; border-radius: var(--radius-ctl);
+    border: 1px solid #c9d5e4; background: #fff; color: var(--color-ink);
+    transition: border-color .15s, box-shadow .15s;
+  }
+  .field:focus { outline: none; border-color: var(--color-market); box-shadow: 0 0 0 3px #1f5fad22; }
+
+  .chip { display: inline-flex; align-items: center; gap: 6px; height: 22px; padding: 0 8px; border-radius: 999px; font-size: 12px; font-weight: 550; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
+
+/* Agent replies (markdown) */
+.prose-bm { color: var(--color-ink); line-height: 1.6; max-width: 72ch; }
+.prose-bm > * + * { margin-top: .7em; }
+.prose-bm h1, .prose-bm h2, .prose-bm h3 { font-variation-settings: "wdth" 110; font-weight: 620; line-height: 1.3; margin-top: 1.1em; }
+.prose-bm h1 { font-size: 17px; } .prose-bm h2 { font-size: 15.5px; } .prose-bm h3 { font-size: 14.5px; }
+.prose-bm strong { font-weight: 640; }
+.prose-bm ul { list-style: disc; padding-left: 1.2em; } .prose-bm ol { list-style: decimal; padding-left: 1.3em; }
+.prose-bm li + li { margin-top: .25em; }
+.prose-bm a { color: var(--color-market); text-decoration: underline; text-underline-offset: 2px; }
+.prose-bm code { font-size: 12.5px; background: var(--color-paper); border: 1px solid var(--color-line); border-radius: 4px; padding: 0 4px; }
+.prose-bm table { width: 100%; border-collapse: collapse; font-size: 13px; font-feature-settings: "tnum" 1; display: block; overflow-x: auto; }
+.prose-bm th { text-align: left; font-weight: 580; color: var(--color-ink-3); border-bottom: 1px solid var(--color-line); padding: 6px 10px 6px 0; white-space: nowrap; }
+.prose-bm td { border-bottom: 1px solid var(--color-line); padding: 6px 10px 6px 0; vertical-align: top; }
+.prose-bm blockquote { border-left: 2px solid var(--color-line); padding-left: 12px; color: var(--color-ink-2); }
