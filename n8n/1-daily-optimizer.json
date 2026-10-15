@@ -1,0 +1,674 @@
+{
+  "name": "Google Ads 1 — Daily Optimizer (approval required)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "50 6 * * *"
+            }
+          ]
+        }
+      },
+      "id": "db07ac72-9a07-45ff-a830-a600cc1ffab7",
+      "name": "Daily 6:50am",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n//  CONFIG  —  the only node you should need to edit.\n//  The same Config node is used in all four workflows. Edit it once,\n//  then copy/paste the node into the other three so they stay in sync.\n//\n//  WHY a Code node instead of a \"Set\" node: it lets every setting carry\n//  a comment explaining what it does, and it can hold lists and objects.\n// =====================================================================\n\nconst config = {\n  // ---------- ACCOUNT ----------\n  // Google Ads customer ID of the CLIENT account, digits only (no dashes).\n  customer_id: '1234567890',\n  // Your manager (MCC) account ID, digits only. Required when you reach the\n  // client account through a manager account (the normal agency setup).\n  login_customer_id: '0987654321',\n  // Developer token from Google Ads > Tools > API Center (in the MCC).\n  // Better: store it as an n8n Variable and use $vars.GOOGLE_ADS_DEV_TOKEN.\n  developer_token: 'PASTE_DEVELOPER_TOKEN_HERE',\n  // Google ships a new API version roughly monthly; each major version lives\n  // about a year. If requests start failing with \"version not found\",\n  // bump this (v25 is supported into Aug 2027).\n  api_version: 'v25',\n  account_timezone: 'America/Los_Angeles',\n  currency: 'USD',\n\n  // ---------- SAFETY SWITCHES ----------\n  // DRY RUN = true: every change is sent with validateOnly, so Google CHECKS\n  // it but changes nothing. Leave this on for the first 1–2 weeks and read\n  // the logs. Flip to false only once the proposals look right to you.\n  dry_run: true,\n  approver_email: 'you@example.com',\n  // Shared secret for runs started from the Blue Market Ads app.\n  // Must match N8N_WEBHOOK_SECRET in Vercel.\n  webhook_secret: 'PASTE_THE_SAME_SECRET_AS_VERCEL',\n  // Hard limits the robot can never exceed, no matter what the math says.\n  max_bid_increase_pct: 15,      // per run, per keyword\n  max_bid_decrease_pct: 25,      // per run, per keyword\n  max_cpc_ceiling: 25.00,        // absolute max bid in dollars\n  min_cpc_floor: 0.50,\n  max_budget_change_pct: 25,     // per run, per budget\n  max_changes_per_run: 40,       // stops a bad run from doing 500 edits\n\n  // ---------- BUSINESS GOALS (Firm Media baseline) ----------\n  monthly_budget_total: 3000,    // client's monthly ad budget, in dollars\n  target_cpa: 250,               // baseline cost per lead\n  // Campaigns whose name contains a key get their own CPA target.\n  // High-value procedures can afford more per lead; low-margin ones less.\n  cpa_overrides: {\n    'All-on-4': 600,\n    'Implant': 450,\n    'Cleaning': 120,\n  },\n  target_ctr: 0.07,              // 7% CTR benchmark\n  call_min_seconds: 60,          // calls shorter than this are not leads\n  // Bid strategy ladder thresholds (conversions in last 30 days)\n  conv_for_max_conversions: 15,\n  conv_for_target_cpa: 30,\n\n  // ---------- DECISION THRESHOLDS ----------\n  // How much a keyword may spend with zero conversions before action.\n  // Expressed as a multiple of the campaign's target CPA.\n  zero_conv_reduce_at: 1.0,      // lower its bid\n  zero_conv_pause_at: 1.5,       // propose pausing it\n  min_impr_for_ctr_check: 200,\n  min_impr_for_qs_check: 100,\n  odd_penny_bids: true,          // $12.00 -> $12.01 (tie-breaker habit)\n\n  // ---------- AI SEARCH-TERM REVIEW ----------\n  anthropic_model: 'claude-sonnet-5-5',\n  // Tell Claude what the business sells so it can judge search intent.\n  business_context:\n    'Dental/periodontal practice. Sells: dental implants, All-on-4, gum ' +\n    'grafting, periodontal treatment, cleanings. Wants new-patient ' +\n    'consultations in the local service area. Does NOT want job seekers, ' +\n    'students, DIY/home remedy seekers, or people looking for free care.',\n  // Search terms containing these are always proposed as negatives.\n  negative_seed_terms: [\n    'job', 'jobs', 'career', 'careers', 'salary', 'hiring', 'school',\n    'course', 'training', 'certification', 'free', 'diy', 'home remedy',\n    'reddit', 'youtube', 'wikipedia', 'pdf', 'definition', 'meaning',\n    'cartoon', 'clipart',\n  ],\n\n  // ---------- GOOGLE SHEET (change log + lead evaluation) ----------\n  // One spreadsheet with two tabs: \"Change Log\" and \"Leads\".\n  sheet_url: 'https://docs.google.com/spreadsheets/d/PASTE_SHEET_ID/edit',\n  log_sheet_tab: 'Change Log',\n  lead_sheet_tab: 'Leads',\n\n  // ---------- OFFLINE REVENUE (Workflow 4) ----------\n  // Map each lead stage in the sheet to a conversion action ID\n  // (Google Ads > Goals > Conversions > click the action > ID in the URL \"ctId=\").\n  // Workflow 3 can create these three actions for you.\n  stage_to_conversion_action: {\n    'Qualified Lead': '111111111',\n    'Booked Consult': '222222222',\n    'Closed - Revenue': '333333333',\n  },\n  // Offset of the sheet's timestamps from UTC (PDT = -07:00, PST = -08:00).\n  sheet_utc_offset: '-07:00',\n};\n\n// ---------- GAQL QUERIES (Google Ads Query Language) ----------\n// Think of these as SQL for your ad account. You rarely need to edit them.\nconfig.queries = {\n  // Whole-account spend this month — includes paused/removed campaigns,\n  // because that money counts against the client's budget too.\n  account_mtd: `\n    SELECT metrics.cost_micros, metrics.conversions\n    FROM customer\n    WHERE segments.date DURING THIS_MONTH`,\n  campaigns_mtd: `\n    SELECT campaign.id, campaign.name, campaign.status,\n           campaign.advertising_channel_type, campaign.bidding_strategy_type,\n           campaign.target_spend.cpc_bid_ceiling_micros,\n           campaign_budget.resource_name, campaign_budget.amount_micros,\n           campaign_budget.explicitly_shared,\n           metrics.cost_micros, metrics.clicks, metrics.impressions,\n           metrics.conversions, metrics.conversions_value,\n           metrics.search_impression_share,\n           metrics.search_budget_lost_impression_share,\n           metrics.search_rank_lost_impression_share, metrics.average_cpc\n    FROM campaign\n    WHERE segments.date DURING THIS_MONTH AND campaign.status = 'ENABLED'`,\n  campaigns_30d: `\n    SELECT campaign.id, metrics.cost_micros, metrics.clicks,\n           metrics.conversions, metrics.conversions_value\n    FROM campaign\n    WHERE segments.date DURING LAST_30_DAYS AND campaign.status = 'ENABLED'`,\n  campaigns_today: `\n    SELECT campaign.id, campaign.name, campaign_budget.resource_name,\n           campaign_budget.amount_micros, metrics.cost_micros,\n           metrics.conversions, metrics.clicks\n    FROM campaign\n    WHERE segments.date DURING TODAY AND campaign.status = 'ENABLED'`,\n  keywords_30d: `\n    SELECT campaign.id, campaign.name, ad_group.id, ad_group.name,\n           ad_group_criterion.resource_name, ad_group_criterion.criterion_id,\n           ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type,\n           ad_group_criterion.cpc_bid_micros,\n           ad_group_criterion.effective_cpc_bid_micros,\n           ad_group_criterion.quality_info.quality_score,\n           ad_group_criterion.quality_info.creative_quality_score,\n           ad_group_criterion.quality_info.post_click_quality_score,\n           ad_group_criterion.quality_info.search_predicted_ctr,\n           metrics.impressions, metrics.clicks, metrics.cost_micros,\n           metrics.conversions, metrics.ctr, metrics.average_cpc,\n           metrics.search_rank_lost_impression_share\n    FROM keyword_view\n    WHERE segments.date DURING LAST_30_DAYS\n      AND ad_group_criterion.status = 'ENABLED'\n      AND ad_group.status = 'ENABLED' AND campaign.status = 'ENABLED'`,\n  search_terms_30d: `\n    SELECT campaign.id, campaign.name, ad_group.id,\n           search_term_view.search_term, search_term_view.status,\n           metrics.impressions, metrics.clicks, metrics.cost_micros,\n           metrics.conversions\n    FROM search_term_view\n    WHERE segments.date DURING LAST_30_DAYS AND metrics.clicks > 0\n    ORDER BY metrics.cost_micros DESC\n    LIMIT 400`,\n  conversion_actions: `\n    SELECT conversion_action.resource_name, conversion_action.id,\n           conversion_action.name, conversion_action.status,\n           conversion_action.type, conversion_action.category,\n           conversion_action.primary_for_goal,\n           conversion_action.counting_type,\n           conversion_action.phone_call_duration_seconds,\n           conversion_action.value_settings.default_value,\n           conversion_action.click_through_lookback_window_days\n    FROM conversion_action\n    WHERE conversion_action.status != 'REMOVED'`,\n  conversions_by_action_14d: `\n    SELECT segments.conversion_action, segments.conversion_action_name,\n           metrics.all_conversions\n    FROM customer\n    WHERE segments.date DURING LAST_14_DAYS`,\n  customer_settings: `\n    SELECT customer.id, customer.descriptive_name,\n           customer.auto_tagging_enabled,\n           customer.conversion_tracking_setting.enhanced_conversions_for_leads_enabled,\n           customer.conversion_tracking_setting.accepted_customer_data_terms\n    FROM customer`,\n};\n\n// ---------- STARTED FROM THE APP? ----------\n// When the Blue Market Ads app starts this workflow, it sends the account\n// to work on. The secret check stops anyone else from triggering it.\nconst body = $input.first()?.json?.body;\nif (body && typeof body === 'object' && body.customer_id) {\n  if (!config.webhook_secret || body.secret !== config.webhook_secret) {\n    throw new Error('Webhook secret does not match. Run refused.');\n  }\n  config.customer_id = String(body.customer_id).replace(/\\D/g, '');\n  config.login_customer_id = String(body.login_customer_id || body.customer_id).replace(/\\D/g, '');\n  config.started_by = body.requested_by || 'Blue Market Ads app';\n  config.account_name = body.account_name || '';\n}\n\nreturn [{ json: config }];\n"
+      },
+      "id": "7ca1cd4f-776e-4851-96ca-88b61dee6f76",
+      "name": "Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://googleads.googleapis.com/{{ $('Config').first().json.api_version }}/customers/{{ $('Config').first().json.customer_id }}/googleAds:search",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleAdsOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "developer-token",
+              "value": "={{ $('Config').first().json.developer_token }}"
+            },
+            {
+              "name": "login-customer-id",
+              "value": "={{ $('Config').first().json.login_customer_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $('Config').first().json.queries.account_mtd }) }}",
+        "options": {}
+      },
+      "id": "b4c11c87-f1c4-416a-9927-1ca61fa17e0c",
+      "name": "Get Account Spend (Month)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://googleads.googleapis.com/{{ $('Config').first().json.api_version }}/customers/{{ $('Config').first().json.customer_id }}/googleAds:search",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleAdsOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "developer-token",
+              "value": "={{ $('Config').first().json.developer_token }}"
+            },
+            {
+              "name": "login-customer-id",
+              "value": "={{ $('Config').first().json.login_customer_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $('Config').first().json.queries.campaigns_mtd }) }}",
+        "options": {}
+      },
+      "id": "533b9e08-f7bb-4819-a606-0d1dcc332c49",
+      "name": "Get Campaigns (Month)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://googleads.googleapis.com/{{ $('Config').first().json.api_version }}/customers/{{ $('Config').first().json.customer_id }}/googleAds:search",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleAdsOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "developer-token",
+              "value": "={{ $('Config').first().json.developer_token }}"
+            },
+            {
+              "name": "login-customer-id",
+              "value": "={{ $('Config').first().json.login_customer_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $('Config').first().json.queries.campaigns_30d }) }}",
+        "options": {}
+      },
+      "id": "6449c8c0-4306-45c7-9f88-857384d938c6",
+      "name": "Get Campaigns (30 Days)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://googleads.googleapis.com/{{ $('Config').first().json.api_version }}/customers/{{ $('Config').first().json.customer_id }}/googleAds:search",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleAdsOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "developer-token",
+              "value": "={{ $('Config').first().json.developer_token }}"
+            },
+            {
+              "name": "login-customer-id",
+              "value": "={{ $('Config').first().json.login_customer_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $('Config').first().json.queries.keywords_30d }) }}",
+        "options": {}
+      },
+      "id": "242222d2-85fc-416f-a72b-c16e2729935e",
+      "name": "Get Keywords",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://googleads.googleapis.com/{{ $('Config').first().json.api_version }}/customers/{{ $('Config').first().json.customer_id }}/googleAds:search",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleAdsOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "developer-token",
+              "value": "={{ $('Config').first().json.developer_token }}"
+            },
+            {
+              "name": "login-customer-id",
+              "value": "={{ $('Config').first().json.login_customer_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $('Config').first().json.queries.search_terms_30d }) }}",
+        "options": {}
+      },
+      "id": "d37b8bc1-2b93-4926-9b2a-ae4f1ddac0bc",
+      "name": "Get Search Terms",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1440,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n//  RULES ENGINE  —  turns raw Google Ads data into proposed changes.\n//\n//  WHY rules in code AND an AI later: math decisions (CPA, pacing, bid\n//  sizes) must be exact and repeatable, so plain code does them. Judgment\n//  calls (\"is 'implant dentist salary' a customer?\") need language\n//  understanding, so only those go to Claude in the next node.\n//\n//  Every proposal carries:\n//    - a plain-English reason (goes in your approval email)\n//    - the exact Google Ads API operation that would carry it out\n// =====================================================================\n\nconst cfg = $('Config').first().json;\nconst rows = (name) => ($(name).first().json.results || []);\n\nconst campMtd = rows('Get Campaigns (Month)');\nconst camp30 = rows('Get Campaigns (30 Days)');\nconst keywords = rows('Get Keywords');\nconst terms = rows('Get Search Terms');\n\n// ---------- small helpers ----------\nconst n = (v) => Number(v || 0);                 // API sends int64 as strings\nconst usd = (micros) => n(micros) / 1e6;         // 1 dollar = 1,000,000 micros\nconst money = (x) => '$' + x.toFixed(2);\nconst pct = (x) => (x * 100).toFixed(1) + '%';\nconst cid = cfg.customer_id;\n\n// Round a dollar bid to whole cents, optionally to an \"odd penny\" (.x1).\n// Google requires bids in multiples of 10,000 micros (= 1 cent).\nfunction toBidMicros(dollars) {\n  let cents = Math.round(dollars * 100);\n  cents = Math.min(cents, Math.round(cfg.max_cpc_ceiling * 100));\n  cents = Math.max(cents, Math.round(cfg.min_cpc_floor * 100));\n  if (cfg.odd_penny_bids && cents % 10 === 0) cents += 1;\n  return String(cents * 10000);\n}\n\n// Which CPA target applies to this campaign?\nfunction targetCpaFor(campaignName) {\n  for (const [key, val] of Object.entries(cfg.cpa_overrides || {})) {\n    if ((campaignName || '').toLowerCase().includes(key.toLowerCase())) return val;\n  }\n  return cfg.target_cpa;\n}\n\n// Today's date in the ACCOUNT's timezone (not the server's).\nconst parts = Object.fromEntries(\n  new Intl.DateTimeFormat('en-US', {\n    timeZone: cfg.account_timezone, year: 'numeric', month: 'numeric', day: 'numeric',\n  }).formatToParts(new Date()).map((p) => [p.type, p.value])\n);\nconst year = n(parts.year), month = n(parts.month), day = n(parts.day);\nconst daysInMonth = new Date(year, month, 0).getDate();\nconst daysLeft = daysInMonth - day + 1;          // includes today\n\nconst proposals = [];        // changes that need your approval\nconst recommendations = [];  // advice only — a human decides and acts\nlet seq = 0;\nconst add = (p) => proposals.push({ id: ++seq, ...p });\n\n// ---------- index 30-day campaign data ----------\nconst c30 = {};\nfor (const r of camp30) c30[r.campaign.id] = r.metrics || {};\n\n// =====================================================================\n//  1. CAMPAIGN LEVEL — bid-strategy ladder, impression share, budgets\n// =====================================================================\nconst campaignInfo = {};\nlet totalDailyBudget = 0;\nconst seenBudgets = new Set();\n\nfor (const r of campMtd) {\n  const c = r.campaign, m = r.metrics || {}, b = r.campaignBudget || {};\n  const id = c.id;\n  const tCpa = targetCpaFor(c.name);\n  const conv30 = n(c30[id]?.conversions);\n  const cost30 = usd(c30[id]?.costMicros);\n  const cpa30 = conv30 > 0 ? cost30 / conv30 : null;\n  const strategy = c.biddingStrategyType;\n  campaignInfo[id] = { name: c.name, strategy, tCpa, conv30, cpa30, cost30 };\n\n  if (!seenBudgets.has(b.resourceName)) {\n    seenBudgets.add(b.resourceName);\n    totalDailyBudget += usd(b.amountMicros);\n  }\n\n  // --- Bid strategy ladder (Firm Media rule + the next rungs) ---\n  // Manual CPC -> Max Conversions at 15+ conv/30d -> Target CPA at 30+.\n  // These are big changes that reset Google's learning, so they are\n  // RECOMMENDATIONS, never automatic.\n  if (strategy === 'MANUAL_CPC' && conv30 >= cfg.conv_for_max_conversions) {\n    recommendations.push(`${c.name}: ${conv30.toFixed(0)} conversions in 30 days ` +\n      `(threshold ${cfg.conv_for_max_conversions}). Ready to move from Manual CPC to ` +\n      `Maximize Conversions. Change it in the UI, then leave it alone for 2 weeks.`);\n  }\n  if (strategy === 'MAXIMIZE_CONVERSIONS' && conv30 >= cfg.conv_for_target_cpa && cpa30) {\n    const suggested = Math.max(cpa30 * 1.05, 1);\n    recommendations.push(`${c.name}: ${conv30.toFixed(0)} conversions at ${money(cpa30)} CPA. ` +\n      `Add a Target CPA of about ${money(suggested)} (current CPA + 5%). Do NOT start ` +\n      `at your dream CPA — a target far below reality starves the campaign of traffic. ` +\n      `Lower it 10% every 2–3 weeks while volume holds.`);\n  }\n  if (strategy === 'MAXIMIZE_CONVERSIONS' && conv30 < cfg.conv_for_max_conversions) {\n    recommendations.push(`${c.name}: on Maximize Conversions with only ${conv30.toFixed(0)} ` +\n      `conversions in 30 days. Too little data for the algorithm — consider returning to ` +\n      `Manual CPC or Max Clicks with a bid ceiling until volume grows.`);\n  }\n  if (strategy === 'TARGET_SPEND' && !n(c.targetSpend?.cpcBidCeilingMicros)) {\n    recommendations.push(`${c.name}: Maximize Clicks has NO max CPC ceiling. Set one ` +\n      `(e.g. your average CPC × 1.5) so a single click can't eat the budget.`);\n  }\n\n  // --- Impression share diagnosis: WHY are we missing searches? ---\n  const lostBudget = n(m.searchBudgetLostImpressionShare);\n  const lostRank = n(m.searchRankLostImpressionShare);\n  if (lostBudget > 0.15 && cpa30 && cpa30 <= tCpa) {\n    recommendations.push(`${c.name}: losing ${pct(lostBudget)} of searches to BUDGET while ` +\n      `CPA (${money(cpa30)}) beats target (${money(tCpa)}). This is your best place to ` +\n      `add money — every extra dollar here buys leads under target.`);\n  }\n  if (lostRank > 0.30) {\n    recommendations.push(`${c.name}: losing ${pct(lostRank)} of searches to AD RANK. ` +\n      `Raising Quality Score is cheaper than raising bids — see the Quality Score notes.`);\n  }\n\n  // --- Firm Media budget formula as a sanity check ---\n  const avgCpc = usd(m.averageCpc);\n  if (avgCpc > 0) {\n    const formula = avgCpc * 10 * 30.4;\n    campaignInfo[id].formulaBudget = formula;\n  }\n}\n\n// =====================================================================\n//  2. BUDGET PACING — spend 100% of the month, not 80% and not 120%\n// =====================================================================\n// Each budget's share of the monthly total = its share of current daily\n// budgets. New daily = (its share of the monthly budget − what it has\n// already spent this month) ÷ days left.\nconst budgetSpend = {}; const budgetAmt = {}; const budgetNames = {}; const budgetCamps = {};\nfor (const r of campMtd) {\n  const b = r.campaignBudget || {};\n  budgetSpend[b.resourceName] = (budgetSpend[b.resourceName] || 0) + usd(r.metrics?.costMicros);\n  budgetAmt[b.resourceName] = usd(b.amountMicros);\n  (budgetNames[b.resourceName] ||= []).push(r.campaign.name);\n  (budgetCamps[b.resourceName] ||= []).push(r.campaign.id);\n}\nconst enabledSpend = Object.values(budgetSpend).reduce((a, x) => a + x, 0);\n// Account-wide spend includes campaigns paused earlier this month. Their\n// spend still counts against the client's monthly budget.\nconst spentMtd = Math.max(rows('Get Account Spend (Month)')\n  .reduce((a, r) => a + usd(r.metrics?.costMicros), 0), enabledSpend);\nconst available = Math.max(cfg.monthly_budget_total - (spentMtd - enabledSpend), 0);\nconst projected = day > 1 ? (spentMtd / (day - 1)) * daysInMonth : 0;\n\n// PERFORMANCE-WEIGHTED POOL (beyond the baseline strategy):\n// The money left this month is one daily \"pool\". Each budget gets a slice\n// sized by its current budget × how well it hits its CPA target. A campaign\n// at half its target CPA gets up to 1.5× weight; one at double its target\n// gets 0.5×. Result: on a limited budget, dollars drift toward the\n// campaigns that turn them into leads most cheaply.\nconst dailyPool = Math.max(available - enabledSpend, 0) / daysLeft;\nconst perf = {};\nfor (const res of Object.keys(budgetAmt)) {\n  const factors = budgetCamps[res].map((id) => {\n    const ci = campaignInfo[id];\n    if (ci.cpa30) return Math.min(Math.max(ci.tCpa / ci.cpa30, 0.5), 1.5);\n    return ci.cost30 > ci.tCpa ? 0.5 : 1;   // spent a lot, no leads -> penalize\n  });\n  perf[res] = factors.reduce((a, x) => a + x, 0) / factors.length;\n}\nconst weightTotal = Object.entries(budgetAmt).reduce((a, [res, d]) => a + d * perf[res], 0);\n\nfor (const [res, daily] of Object.entries(budgetAmt)) {\n  if (!weightTotal || !daily) continue;\n  const share = (daily * perf[res]) / weightTotal;\n  const monthlyShare = budgetSpend[res] + dailyPool * daysLeft * share;\n  let ideal = dailyPool * share;\n  // Respect the per-run change limit\n  const maxUp = daily * (1 + cfg.max_budget_change_pct / 100);\n  const maxDown = daily * (1 - cfg.max_budget_change_pct / 100);\n  ideal = Math.min(Math.max(ideal, maxDown), maxUp);\n  const change = (ideal - daily) / daily;\n  // Never pour more money into a budget whose campaigns are missing their\n  // CPA target. Underspending is better than overspending on bad leads.\n  if (change > 0) {\n    const poor = budgetCamps[res].map((id) => campaignInfo[id]).find((ci) =>\n      (ci.cpa30 && ci.cpa30 > ci.tCpa * 1.3) || (!ci.conv30 && ci.cost30 > ci.tCpa * 2));\n    if (poor) {\n      recommendations.push(`${poor.name}: under-spending, but performance is off target ` +\n        `(${poor.cpa30 ? 'CPA $' + poor.cpa30.toFixed(2) : 'no conversions'}). Budget NOT raised. ` +\n        `Fix keywords/landing page first, or move this money to a campaign that is hitting target.`);\n      continue;\n    }\n  }\n  if (Math.abs(change) >= 0.10) {\n    const cents = Math.max(Math.round(ideal * 100), 100);\n    add({\n      type: 'SET_BUDGET',\n      campaign_name: budgetNames[res].join(', '),\n      summary: `Daily budget ${money(daily)} → ${money(cents / 100)}`,\n      reason: `Pacing: ${money(budgetSpend[res])} spent so far, ${daysLeft} days left. ` +\n        `Performance weight ${perf[res].toFixed(2)}× (CPA vs target) — ` +\n        `${perf[res] >= 1 ? 'protected as a strong performer' : 'trimmed first because it is over its CPA target'}. ` +\n        `Lands the month on budget.`,\n      direction: change > 0 ? 'up' : 'down',\n      endpoint: 'campaignBudgets:mutate',\n      operation: { update: { resourceName: res, amountMicros: String(cents * 10000) },\n                   updateMask: 'amountMicros' },\n    });\n  }\n}\n\n// =====================================================================\n//  3. KEYWORD LEVEL — bids, pauses, CTR and Quality Score\n// =====================================================================\nconst existingKeywords = new Set();\nfor (const r of keywords) {\n  const k = r.adGroupCriterion || {}, m = r.metrics || {};\n  const camp = campaignInfo[r.campaign.id] || { name: r.campaign.name, strategy: '' };\n  const text = k.keyword?.text || '';\n  existingKeywords.add(text.toLowerCase());\n  const tCpa = targetCpaFor(camp.name);\n  const cost = usd(m.costMicros), conv = n(m.conversions);\n  const clicks = n(m.clicks), impr = n(m.impressions), ctr = n(m.ctr);\n  const label = `\"${text}\" [${k.keyword?.matchType}] in ${camp.name}`;\n\n  // Keyword bids only matter on MANUAL CPC. On Smart Bidding Google\n  // ignores them, so changing them would do nothing.\n  const manual = camp.strategy === 'MANUAL_CPC';\n  const bid = usd(k.cpcBidMicros || k.effectiveCpcBidMicros);\n\n  // --- Zero-conversion spenders ---\n  if (conv === 0 && cost >= tCpa * cfg.zero_conv_pause_at) {\n    add({\n      type: 'PAUSE_KEYWORD', campaign_name: camp.name,\n      summary: `Pause ${label}`,\n      reason: `Spent ${money(cost)} (${clicks} clicks) with 0 conversions — over ` +\n        `${cfg.zero_conv_pause_at}× the ${money(tCpa)} target CPA. Statistically it ` +\n        `should have converted by now.`,\n      endpoint: 'adGroupCriteria:mutate',\n      operation: { update: { resourceName: k.resourceName, status: 'PAUSED' }, updateMask: 'status' },\n    });\n    continue;\n  }\n  if (manual && bid > 0 && conv === 0 && cost >= tCpa * cfg.zero_conv_reduce_at) {\n    const newBid = bid * (1 - cfg.max_bid_decrease_pct / 100);\n    add({\n      type: 'BID_DOWN', campaign_name: camp.name,\n      summary: `Bid ${money(bid)} → ${money(usd(toBidMicros(newBid)))} on ${label}`,\n      reason: `Spent ${money(cost)} with 0 conversions (≥ 1× target CPA). Cheaper clicks ` +\n        `buy more chances to convert before deciding to pause.`,\n      endpoint: 'adGroupCriteria:mutate',\n      operation: { update: { resourceName: k.resourceName, cpcBidMicros: toBidMicros(newBid) },\n                   updateMask: 'cpcBidMicros' },\n    });\n    continue;\n  }\n\n  // --- Converting keywords: steer CPA toward target ---\n  if (manual && bid > 0 && conv >= 1) {\n    const cpa = cost / conv;\n    if (cpa > tCpa * 1.3) {\n      // Scale the bid by target/actual, capped by the per-run limit.\n      const factor = Math.max(tCpa / cpa, 1 - cfg.max_bid_decrease_pct / 100);\n      add({\n        type: 'BID_DOWN', campaign_name: camp.name,\n        summary: `Bid ${money(bid)} → ${money(usd(toBidMicros(bid * factor)))} on ${label}`,\n        reason: `CPA ${money(cpa)} is ${((cpa / tCpa - 1) * 100).toFixed(0)}% over the ` +\n          `${money(tCpa)} target (${conv.toFixed(1)} conv).`,\n        endpoint: 'adGroupCriteria:mutate',\n        operation: { update: { resourceName: k.resourceName, cpcBidMicros: toBidMicros(bid * factor) },\n                     updateMask: 'cpcBidMicros' },\n      });\n    } else if (cpa < tCpa * 0.7 && n(m.searchRankLostImpressionShare) > 0.2) {\n      const factor = 1 + cfg.max_bid_increase_pct / 100;\n      add({\n        type: 'BID_UP', campaign_name: camp.name,\n        summary: `Bid ${money(bid)} → ${money(usd(toBidMicros(bid * factor)))} on ${label}`,\n        reason: `Winner: CPA ${money(cpa)} is well under target, yet it misses ` +\n          `${pct(n(m.searchRankLostImpressionShare))} of searches to ad rank. More of ` +\n          `these clicks = more leads under target.`,\n        direction: 'up',\n        endpoint: 'adGroupCriteria:mutate',\n        operation: { update: { resourceName: k.resourceName, cpcBidMicros: toBidMicros(bid * factor) },\n                     updateMask: 'cpcBidMicros' },\n      });\n    }\n  }\n\n  // --- Low CTR: an ad/keyword relevance problem, not a bid problem ---\n  if (impr >= cfg.min_impr_for_ctr_check && ctr < cfg.target_ctr) {\n    if (ctr < cfg.target_ctr / 2) {\n      recommendations.push(`${label}: CTR ${pct(ctr)} on ${impr} impressions (target ` +\n        `${pct(cfg.target_ctr)}). Ads don't match this search — write an ad group/ad that ` +\n        `repeats this keyword in the headline, or tighten the match type.`);\n    }\n  }\n\n  // --- Quality Score: diagnose WHICH of the 3 parts is weak ---\n  const qs = n(k.qualityInfo?.qualityScore);\n  if (qs && qs <= 5 && impr >= cfg.min_impr_for_qs_check) {\n    const qi = k.qualityInfo;\n    const weak = [];\n    if (qi.searchPredictedCtr === 'BELOW_AVERAGE') weak.push('expected CTR (stronger, more specific headlines)');\n    if (qi.creativeQualityScore === 'BELOW_AVERAGE') weak.push('ad relevance (put the keyword in the ad)');\n    if (qi.postClickQualityScore === 'BELOW_AVERAGE') weak.push('landing page (speed, message match, CTA above the fold)');\n    recommendations.push(`${label}: Quality Score ${qs}/10. Weak: ${weak.join('; ') || 'average across the board'}.`);\n  }\n}\n\n// =====================================================================\n//  4. SEARCH TERMS — negatives (waste) and new keywords (expansion)\n// =====================================================================\nconst candidates = [];\nconst seeds = (cfg.negative_seed_terms || []).map((s) => s.toLowerCase());\nconst negSeen = new Set();\nfor (const r of terms) {\n  const st = r.searchTermView || {}, m = r.metrics || {};\n  const term = (st.searchTerm || '').toLowerCase();\n  const camp = campaignInfo[r.campaign.id] || { name: r.campaign.name };\n  const tCpa = targetCpaFor(camp.name);\n  const cost = usd(m.costMicros), conv = n(m.conversions), clicks = n(m.clicks);\n  if (st.status === 'EXCLUDED') continue;\n\n  const words = term.split(/\\s+/);\n  const seedHit = seeds.find((s) => (s.includes(' ') ? term.includes(s) : words.includes(s)));\n  const key = r.campaign.id + '|' + term;\n\n  if (seedHit && conv === 0 && !negSeen.has(key)) {\n    negSeen.add(key);\n    add({\n      type: 'ADD_NEGATIVE', campaign_name: camp.name,\n      summary: `Negative [exact] \"${term}\"`,\n      reason: `Contains blocked word \"${seedHit}\". ${money(cost)} spent, 0 conversions.`,\n      endpoint: 'campaignCriteria:mutate',\n      operation: { create: { campaign: `customers/${cid}/campaigns/${r.campaign.id}`,\n        negative: true, keyword: { text: term, matchType: 'EXACT' } } },\n    });\n  } else if (conv === 0 && clicks >= 2 && cost >= tCpa * 0.2) {\n    // Not obviously junk — let Claude judge the intent.\n    candidates.push({ term, campaign_id: r.campaign.id, campaign: camp.name,\n                      clicks, cost: +cost.toFixed(2) });\n  } else if (conv >= 1 && st.status !== 'ADDED' && !existingKeywords.has(term)) {\n    // EXPANSION: a real search that already produced a lead but isn't a\n    // keyword yet. Adding it as EXACT gives you control of its bid and ad.\n    const cpc = clicks ? cost / clicks : cfg.min_cpc_floor;\n    add({\n      type: 'ADD_KEYWORD', campaign_name: camp.name,\n      summary: `New keyword [exact] \"${term}\" at ${money(usd(toBidMicros(cpc)))}`,\n      reason: `Already converted ${conv.toFixed(1)}× at ${money(cost / conv)} per lead ` +\n        `through a broader keyword. Owning it as exact match lets you bid on it directly.`,\n      endpoint: 'adGroupCriteria:mutate',\n      operation: { create: { adGroup: `customers/${cid}/adGroups/${r.adGroup.id}`,\n        status: 'ENABLED', keyword: { text: term, matchType: 'EXACT' },\n        cpcBidMicros: toBidMicros(cpc) } },\n    });\n  }\n}\n\n// ---------- prompt for Claude (only the ambiguous terms) ----------\nconst aiCandidates = candidates.slice(0, 150);\nconst ai_prompt = aiCandidates.length === 0 ? '' :\n`You are reviewing Google Ads search terms for wasted spend.\n\nBUSINESS: ${cfg.business_context}\n\nEach search term below got clicks but no conversions. Decide for each one:\n- \"negative\" if the searcher is clearly NOT a potential customer (wrong service,\n  job seeker, researcher, DIY, wrong location, competitor brand, etc.)\n- \"keep\" if a real customer could plausibly search this, even if it hasn't\n  converted yet.\nWhen unsure, choose \"keep\" — blocking a good search costs more than a few clicks.\n\nReturn ONLY valid JSON, no prose, in exactly this shape:\n{\"decisions\":[{\"term\":\"...\",\"campaign_id\":\"...\",\"decision\":\"negative\"|\"keep\",\n\"match_type\":\"EXACT\"|\"PHRASE\",\"reason\":\"under 15 words\"}]}\nUse PHRASE only when a word in the term makes every variation irrelevant.\n\nSEARCH TERMS:\n${JSON.stringify(aiCandidates)}`;\n\n// ---------- account-level summary for the email ----------\nconst totalConv30 = Object.values(c30).reduce((a, m) => a + n(m.conversions), 0);\nconst totalCost30 = Object.values(c30).reduce((a, m) => a + usd(m.costMicros), 0);\nconst summary = {\n  date: `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`,\n  spent_mtd: +spentMtd.toFixed(2),\n  monthly_budget: cfg.monthly_budget_total,\n  projected_month_end: +projected.toFixed(2),\n  conversions_30d: +totalConv30.toFixed(1),\n  cpa_30d: totalConv30 ? +(totalCost30 / totalConv30).toFixed(2) : null,\n  campaigns: Object.keys(campaignInfo).length,\n  keywords_reviewed: keywords.length,\n  search_terms_reviewed: terms.length,\n};\n\nreturn [{ json: { summary, proposals, recommendations, ai_candidates: aiCandidates, ai_prompt } }];\n"
+      },
+      "id": "aa233de0-0459-4f8a-9a2f-34d1987ac1d4",
+      "name": "Rules Engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "anthropicApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $('Config').first().json.anthropic_model, max_tokens: 4000, messages: [{ role: 'user', content: $json.ai_prompt || 'Reply with exactly: {\"decisions\":[]}' }] }) }}",
+        "options": {
+          "timeout": 120000
+        }
+      },
+      "id": "8d3a1fd5-b238-4c2b-aec1-8d012f55b47b",
+      "name": "AI Search Term Review",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1920,
+        300
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n//  MERGE AI + BUILD APPROVAL EMAIL\n//  Adds Claude's negative-keyword picks to the rule-based proposals,\n//  applies the safety cap, and writes the email you approve or reject.\n// =====================================================================\n\nconst cfg = $('Config').first().json;\nconst base = $('Rules Engine').first().json;\nconst proposals = [...base.proposals];\nconst cid = cfg.customer_id;\n\n// ---------- read Claude's answer (fail safe: no answer = no AI changes) ----------\nlet aiNote = '';\ntry {\n  const resp = $('AI Search Term Review').first().json;\n  if (resp.error) throw new Error(resp.error.message || 'API error');\n  const text = (resp.content || []).map((c) => c.text || '').join('');\n  if (text.trim()) {\n    // Claude sometimes wraps JSON in ```json fences — strip them.\n    const clean = text.replace(/```json|```/g, '').trim();\n    const parsed = JSON.parse(clean.slice(clean.indexOf('{'), clean.lastIndexOf('}') + 1));\n    // Only accept terms we actually sent. Never trust an AI to invent targets.\n    const allowed = new Map(base.ai_candidates.map((c) => [c.campaign_id + '|' + c.term, c]));\n    let added = 0;\n    for (const d of parsed.decisions || []) {\n      const cand = allowed.get(String(d.campaign_id) + '|' + String(d.term).toLowerCase());\n      if (!cand || d.decision !== 'negative') continue;\n      const match = d.match_type === 'PHRASE' ? 'PHRASE' : 'EXACT';\n      proposals.push({\n        id: proposals.length + 1, type: 'ADD_NEGATIVE', campaign_name: cand.campaign,\n        summary: `Negative [${match.toLowerCase()}] \"${cand.term}\" (AI)`,\n        reason: `${d.reason || 'Off-intent search'} — $${cand.cost} spent, 0 conversions.`,\n        endpoint: 'campaignCriteria:mutate',\n        operation: { create: { campaign: `customers/${cid}/campaigns/${cand.campaign_id}`,\n          negative: true, keyword: { text: cand.term, matchType: match } } },\n      });\n      added++;\n    }\n    aiNote = `Claude reviewed ${base.ai_candidates.length} unclear search terms and flagged ${added}.`;\n  }\n} catch (e) {\n  aiNote = `AI review skipped (${e.message}). Rule-based proposals only.`;\n}\n\n// ---------- safety cap: money-saving changes first ----------\nconst priority = { ADD_NEGATIVE: 1, PAUSE_KEYWORD: 2, BID_DOWN: 3, SET_BUDGET: 4, ADD_KEYWORD: 5, BID_UP: 6 };\nproposals.sort((a, b) => priority[a.type] - priority[b.type]);\nconst kept = proposals.slice(0, cfg.max_changes_per_run);\nconst dropped = proposals.length - kept.length;\nkept.forEach((p, i) => (p.id = i + 1));\n\n// ---------- write the email ----------\nconst s = base.summary;\nconst L = [];\nL.push(`GOOGLE ADS DAILY OPTIMIZER — ${s.date}`);\nL.push(cfg.dry_run ? 'MODE: DRY RUN (approving only tests the changes; nothing goes live)' : 'MODE: LIVE (approving applies these changes)');\nL.push('');\nL.push('ACCOUNT SNAPSHOT');\nL.push(`• Spent this month: $${s.spent_mtd} of $${s.monthly_budget} (projected month-end: $${s.projected_month_end})`);\nL.push(`• Last 30 days: ${s.conversions_30d} conversions, CPA ${s.cpa_30d ? '$' + s.cpa_30d : 'n/a'} (target $${cfg.target_cpa})`);\nL.push(`• Reviewed ${s.campaigns} campaigns, ${s.keywords_reviewed} keywords, ${s.search_terms_reviewed} search terms`);\nif (aiNote) L.push(`• ${aiNote}`);\nL.push('');\n\nconst groups = {\n  ADD_NEGATIVE: 'BLOCK WASTED SEARCHES', PAUSE_KEYWORD: 'PAUSE NON-CONVERTING KEYWORDS',\n  BID_DOWN: 'LOWER BIDS', SET_BUDGET: 'BUDGET PACING', ADD_KEYWORD: 'ADD PROVEN SEARCHES AS KEYWORDS',\n  BID_UP: 'RAISE BIDS ON WINNERS',\n};\nif (kept.length === 0) {\n  L.push('NO CHANGES PROPOSED TODAY. Approving or rejecting does nothing.');\n} else {\n  L.push(`PROPOSED CHANGES (${kept.length})`);\n  for (const [type, title] of Object.entries(groups)) {\n    const list = kept.filter((p) => p.type === type);\n    if (!list.length) continue;\n    L.push('');\n    L.push(`— ${title} —`);\n    for (const p of list) {\n      L.push(`${p.id}. ${p.summary}  (${p.campaign_name})`);\n      L.push(`   Why: ${p.reason}`);\n    }\n  }\n  if (dropped > 0) L.push(`\\n(${dropped} lower-priority changes held back by the ${cfg.max_changes_per_run}-change safety cap.)`);\n}\n\nif (base.recommendations.length) {\n  L.push('');\n  L.push('RECOMMENDATIONS (not applied automatically — your call)');\n  base.recommendations.slice(0, 25).forEach((r) => L.push(`• ${r}`));\n}\nL.push('');\nL.push('Approve = apply every numbered change above. Reject = change nothing.');\n\nreturn [{ json: {\n  email_subject: `[Ads Optimizer] ${kept.length} changes to review — ${s.date}${cfg.dry_run ? ' (dry run)' : ''}`,\n  // Plain text on purpose: n8n's approval email keeps line breaks.\n  email_body: L.join('\\n'),\n  proposals: kept,\n  summary: s,\n} }];\n"
+      },
+      "id": "fe85252b-0b6a-4a12-9dff-80a4f7cd2330",
+      "name": "Merge AI + Build Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendAndWait",
+        "sendTo": "={{ $('Config').first().json.approver_email }}",
+        "subject": "={{ $json.email_subject }}",
+        "message": "={{ $json.email_body }}",
+        "approvalOptions": {
+          "values": {
+            "approvalType": "double",
+            "approveLabel": "Approve changes",
+            "disapproveLabel": "Reject"
+          }
+        },
+        "options": {
+          "limitWaitTime": {
+            "values": {
+              "limitType": "afterTimeInterval",
+              "resumeAmount": 20,
+              "resumeUnit": "hours"
+            }
+          }
+        }
+      },
+      "id": "38767043-0c09-4597-82f9-c31c26128f01",
+      "name": "Approve Changes?",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        2400,
+        300
+      ],
+      "webhookId": "c647fb6b-92e4-4c05-a360-d2aba14db2e4"
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n//  BUILD API REQUESTS — runs only after the approval email comes back.\n//  Groups approved changes by API endpoint so each endpoint gets ONE\n//  request carrying many operations (faster, and fewer API calls).\n// =====================================================================\n\nconst cfg = $('Config').first().json;\nconst approval = $input.first().json;\n// n8n puts the button result in data.approved. A timeout = no approval.\nconst approved = approval?.data?.approved === true || approval?.approved === true;\nif (!approved) return [];   // returning nothing stops the workflow here\n\nconst { proposals } = $('Merge AI + Build Email').first().json;\nconst byEndpoint = {};\nfor (const p of proposals) (byEndpoint[p.endpoint] ||= []).push(p);\n\nconst out = [];\nfor (const [endpoint, list] of Object.entries(byEndpoint)) {\n  out.push({ json: {\n    url: `https://googleads.googleapis.com/${cfg.api_version}/customers/${cfg.customer_id}/${endpoint}`,\n    body: {\n      operations: list.map((p) => p.operation),\n      // partialFailure: one bad operation won't block the good ones.\n      partialFailure: true,\n      // validateOnly: Google checks everything but changes nothing.\n      validateOnly: cfg.dry_run === true,\n    },\n    endpoint,\n    proposal_ids: list.map((p) => p.id),\n    summaries: list.map((p) => p.summary),\n  } });\n}\nreturn out;\n"
+      },
+      "id": "d23e1cf5-b019-44d6-84f1-831c74916d39",
+      "name": "Build API Requests",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleAdsOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "developer-token",
+              "value": "={{ $('Config').first().json.developer_token }}"
+            },
+            {
+              "name": "login-customer-id",
+              "value": "={{ $('Config').first().json.login_customer_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {}
+      },
+      "id": "30042aaf-9c4e-47cb-8725-6553663fb682",
+      "name": "Apply to Google Ads",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2880,
+        300
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n//  LOG RESULTS — one spreadsheet row per change, so you have a full\n//  history of what the system did, when, and whether Google accepted it.\n// =====================================================================\n\nconst cfg = $('Config').first().json;\nconst requests = $('Build API Requests').all();\nconst responses = $input.all();\nconst rows = [];\nconst now = new Date().toISOString();\n\nrequests.forEach((req, i) => {\n  const res = responses[i]?.json || {};\n  const results = res.results || [];\n  const httpError = res.error ? (res.error.message || JSON.stringify(res.error)).slice(0, 300) : '';\n  // With partialFailure, failed operations come back as empty {} results.\n  const pfErrors = (res.partialFailureError?.details || [])\n    .flatMap((d) => d.errors || []).map((e) => e.message);\n\n  req.json.summaries.forEach((summary, j) => {\n    const ok = !httpError && results[j] && Object.keys(results[j]).length > 0;\n    rows.push({ json: {\n      timestamp: now,\n      mode: cfg.dry_run ? 'DRY RUN' : 'LIVE',\n      customer_id: cfg.customer_id,\n      endpoint: req.json.endpoint,\n      change: summary,\n      status: httpError ? 'ERROR' : (ok || cfg.dry_run && !pfErrors.length ? 'OK' : 'FAILED'),\n      detail: httpError || (ok ? (results[j].resourceName || '') : (pfErrors.shift() || '')),\n    } });\n  });\n});\nreturn rows;\n"
+      },
+      "id": "29e10bdd-ca8d-48e6-ab6b-a6fb62ab5faf",
+      "name": "Log Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "url",
+          "value": "={{ $('Config').first().json.sheet_url }}"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $('Config').first().json.log_sheet_tab }}"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "42ab4061-8f56-4782-b7c4-96bb8100bffb",
+      "name": "Write Change Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        3360,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 1 · Settings\nEdit **Config** only. `dry_run: true` = Google checks every change but applies nothing. Keep it on for 1–2 weeks.",
+        "width": 300,
+        "height": 230,
+        "color": 4
+      },
+      "id": "9d374522-20da-41a7-9b23-80dc05aed7a7",
+      "name": "Note bf9d90",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        200,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 2 · Pull data (read-only)\nFive GAQL reports: account spend, campaigns this month and last 30 days, keywords, search terms. If any fails, the run stops — never optimize on missing data.",
+        "width": 1180,
+        "height": 230,
+        "color": 5
+      },
+      "id": "0f26a1dd-65ad-4677-a9ca-f9b48f9025ba",
+      "name": "Note d6562c",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        440,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 3 · Decide\n**Rules Engine** does the math (CPA, pacing, bids, Quality Score). **Claude** only judges unclear search terms. The merge node accepts only terms it actually sent to Claude.",
+        "width": 700,
+        "height": 230,
+        "color": 6
+      },
+      "id": "d13d63c1-e606-44f8-ae28-947f82f08d33",
+      "name": "Note a9246d",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1640,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 4 · You approve\nEmail with every change and why. Approve = apply all. Reject or no answer in 20 h = nothing changes.",
+        "width": 300,
+        "height": 230,
+        "color": 3
+      },
+      "id": "805cdfa8-b811-4e0f-a0be-7a767c087f25",
+      "name": "Note fe51c9",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2360,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## 5 · Apply + log\nOne request per API endpoint, `partialFailure` on, every change written to the **Change Log** tab.",
+        "width": 940,
+        "height": 230,
+        "color": 4
+      },
+      "id": "f3f1ebc3-428c-4944-a3a0-4aa1a2f97ae1",
+      "name": "Note 14b27a",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        2600,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "blue-market-optimizer",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "bfad7792-7664-4e59-9a88-a63b9091798e",
+      "name": "Started from App",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        520
+      ],
+      "webhookId": "94ec3090-305e-42cd-b8b0-d6af47314c5e"
+    }
+  ],
+  "connections": {
+    "Daily 6:50am": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Get Account Spend (Month)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Account Spend (Month)": {
+      "main": [
+        [
+          {
+            "node": "Get Campaigns (Month)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Campaigns (Month)": {
+      "main": [
+        [
+          {
+            "node": "Get Campaigns (30 Days)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Campaigns (30 Days)": {
+      "main": [
+        [
+          {
+            "node": "Get Keywords",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Keywords": {
+      "main": [
+        [
+          {
+            "node": "Get Search Terms",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Search Terms": {
+      "main": [
+        [
+          {
+            "node": "Rules Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rules Engine": {
+      "main": [
+        [
+          {
+            "node": "AI Search Term Review",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Search Term Review": {
+      "main": [
+        [
+          {
+            "node": "Merge AI + Build Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge AI + Build Email": {
+      "main": [
+        [
+          {
+            "node": "Approve Changes?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approve Changes?": {
+      "main": [
+        [
+          {
+            "node": "Build API Requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build API Requests": {
+      "main": [
+        [
+          {
+            "node": "Apply to Google Ads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply to Google Ads": {
+      "main": [
+        [
+          {
+            "node": "Log Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Results": {
+      "main": [
+        [
+          {
+            "node": "Write Change Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Started from App": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Los_Angeles",
+    "saveManualExecutions": true
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

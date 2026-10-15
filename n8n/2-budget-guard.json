@@ -1,0 +1,438 @@
+{
+  "name": "Google Ads 2 — Budget Guard (auto-protect)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "5 */3 * * *"
+            }
+          ]
+        }
+      },
+      "id": "a67f07d1-97af-4f92-9252-7c1d646149a2",
+      "name": "Every 3 Hours",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n//  CONFIG  —  the only node you should need to edit.\n//  The same Config node is used in all four workflows. Edit it once,\n//  then copy/paste the node into the other three so they stay in sync.\n//\n//  WHY a Code node instead of a \"Set\" node: it lets every setting carry\n//  a comment explaining what it does, and it can hold lists and objects.\n// =====================================================================\n\nconst config = {\n  // ---------- ACCOUNT ----------\n  // Google Ads customer ID of the CLIENT account, digits only (no dashes).\n  customer_id: '1234567890',\n  // Your manager (MCC) account ID, digits only. Required when you reach the\n  // client account through a manager account (the normal agency setup).\n  login_customer_id: '0987654321',\n  // Developer token from Google Ads > Tools > API Center (in the MCC).\n  // Better: store it as an n8n Variable and use $vars.GOOGLE_ADS_DEV_TOKEN.\n  developer_token: 'PASTE_DEVELOPER_TOKEN_HERE',\n  // Google ships a new API version roughly monthly; each major version lives\n  // about a year. If requests start failing with \"version not found\",\n  // bump this (v25 is supported into Aug 2027).\n  api_version: 'v25',\n  account_timezone: 'America/Los_Angeles',\n  currency: 'USD',\n\n  // ---------- SAFETY SWITCHES ----------\n  // DRY RUN = true: every change is sent with validateOnly, so Google CHECKS\n  // it but changes nothing. Leave this on for the first 1–2 weeks and read\n  // the logs. Flip to false only once the proposals look right to you.\n  dry_run: true,\n  approver_email: 'you@example.com',\n  // Shared secret for runs started from the Blue Market Ads app.\n  // Must match N8N_WEBHOOK_SECRET in Vercel.\n  webhook_secret: 'PASTE_THE_SAME_SECRET_AS_VERCEL',\n  // Hard limits the robot can never exceed, no matter what the math says.\n  max_bid_increase_pct: 15,      // per run, per keyword\n  max_bid_decrease_pct: 25,      // per run, per keyword\n  max_cpc_ceiling: 25.00,        // absolute max bid in dollars\n  min_cpc_floor: 0.50,\n  max_budget_change_pct: 25,     // per run, per budget\n  max_changes_per_run: 40,       // stops a bad run from doing 500 edits\n\n  // ---------- BUSINESS GOALS (Firm Media baseline) ----------\n  monthly_budget_total: 3000,    // client's monthly ad budget, in dollars\n  target_cpa: 250,               // baseline cost per lead\n  // Campaigns whose name contains a key get their own CPA target.\n  // High-value procedures can afford more per lead; low-margin ones less.\n  cpa_overrides: {\n    'All-on-4': 600,\n    'Implant': 450,\n    'Cleaning': 120,\n  },\n  target_ctr: 0.07,              // 7% CTR benchmark\n  call_min_seconds: 60,          // calls shorter than this are not leads\n  // Bid strategy ladder thresholds (conversions in last 30 days)\n  conv_for_max_conversions: 15,\n  conv_for_target_cpa: 30,\n\n  // ---------- DECISION THRESHOLDS ----------\n  // How much a keyword may spend with zero conversions before action.\n  // Expressed as a multiple of the campaign's target CPA.\n  zero_conv_reduce_at: 1.0,      // lower its bid\n  zero_conv_pause_at: 1.5,       // propose pausing it\n  min_impr_for_ctr_check: 200,\n  min_impr_for_qs_check: 100,\n  odd_penny_bids: true,          // $12.00 -> $12.01 (tie-breaker habit)\n\n  // ---------- AI SEARCH-TERM REVIEW ----------\n  anthropic_model: 'claude-sonnet-5-5',\n  // Tell Claude what the business sells so it can judge search intent.\n  business_context:\n    'Dental/periodontal practice. Sells: dental implants, All-on-4, gum ' +\n    'grafting, periodontal treatment, cleanings. Wants new-patient ' +\n    'consultations in the local service area. Does NOT want job seekers, ' +\n    'students, DIY/home remedy seekers, or people looking for free care.',\n  // Search terms containing these are always proposed as negatives.\n  negative_seed_terms: [\n    'job', 'jobs', 'career', 'careers', 'salary', 'hiring', 'school',\n    'course', 'training', 'certification', 'free', 'diy', 'home remedy',\n    'reddit', 'youtube', 'wikipedia', 'pdf', 'definition', 'meaning',\n    'cartoon', 'clipart',\n  ],\n\n  // ---------- GOOGLE SHEET (change log + lead evaluation) ----------\n  // One spreadsheet with two tabs: \"Change Log\" and \"Leads\".\n  sheet_url: 'https://docs.google.com/spreadsheets/d/PASTE_SHEET_ID/edit',\n  log_sheet_tab: 'Change Log',\n  lead_sheet_tab: 'Leads',\n\n  // ---------- OFFLINE REVENUE (Workflow 4) ----------\n  // Map each lead stage in the sheet to a conversion action ID\n  // (Google Ads > Goals > Conversions > click the action > ID in the URL \"ctId=\").\n  // Workflow 3 can create these three actions for you.\n  stage_to_conversion_action: {\n    'Qualified Lead': '111111111',\n    'Booked Consult': '222222222',\n    'Closed - Revenue': '333333333',\n  },\n  // Offset of the sheet's timestamps from UTC (PDT = -07:00, PST = -08:00).\n  sheet_utc_offset: '-07:00',\n};\n\n// ---------- GAQL QUERIES (Google Ads Query Language) ----------\n// Think of these as SQL for your ad account. You rarely need to edit them.\nconfig.queries = {\n  // Whole-account spend this month — includes paused/removed campaigns,\n  // because that money counts against the client's budget too.\n  account_mtd: `\n    SELECT metrics.cost_micros, metrics.conversions\n    FROM customer\n    WHERE segments.date DURING THIS_MONTH`,\n  campaigns_mtd: `\n    SELECT campaign.id, campaign.name, campaign.status,\n           campaign.advertising_channel_type, campaign.bidding_strategy_type,\n           campaign.target_spend.cpc_bid_ceiling_micros,\n           campaign_budget.resource_name, campaign_budget.amount_micros,\n           campaign_budget.explicitly_shared,\n           metrics.cost_micros, metrics.clicks, metrics.impressions,\n           metrics.conversions, metrics.conversions_value,\n           metrics.search_impression_share,\n           metrics.search_budget_lost_impression_share,\n           metrics.search_rank_lost_impression_share, metrics.average_cpc\n    FROM campaign\n    WHERE segments.date DURING THIS_MONTH AND campaign.status = 'ENABLED'`,\n  campaigns_30d: `\n    SELECT campaign.id, metrics.cost_micros, metrics.clicks,\n           metrics.conversions, metrics.conversions_value\n    FROM campaign\n    WHERE segments.date DURING LAST_30_DAYS AND campaign.status = 'ENABLED'`,\n  campaigns_today: `\n    SELECT campaign.id, campaign.name, campaign_budget.resource_name,\n           campaign_budget.amount_micros, metrics.cost_micros,\n           metrics.conversions, metrics.clicks\n    FROM campaign\n    WHERE segments.date DURING TODAY AND campaign.status = 'ENABLED'`,\n  keywords_30d: `\n    SELECT campaign.id, campaign.name, ad_group.id, ad_group.name,\n           ad_group_criterion.resource_name, ad_group_criterion.criterion_id,\n           ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type,\n           ad_group_criterion.cpc_bid_micros,\n           ad_group_criterion.effective_cpc_bid_micros,\n           ad_group_criterion.quality_info.quality_score,\n           ad_group_criterion.quality_info.creative_quality_score,\n           ad_group_criterion.quality_info.post_click_quality_score,\n           ad_group_criterion.quality_info.search_predicted_ctr,\n           metrics.impressions, metrics.clicks, metrics.cost_micros,\n           metrics.conversions, metrics.ctr, metrics.average_cpc,\n           metrics.search_rank_lost_impression_share\n    FROM keyword_view\n    WHERE segments.date DURING LAST_30_DAYS\n      AND ad_group_criterion.status = 'ENABLED'\n      AND ad_group.status = 'ENABLED' AND campaign.status = 'ENABLED'`,\n  search_terms_30d: `\n    SELECT campaign.id, campaign.name, ad_group.id,\n           search_term_view.search_term, search_term_view.status,\n           metrics.impressions, metrics.clicks, metrics.cost_micros,\n           metrics.conversions\n    FROM search_term_view\n    WHERE segments.date DURING LAST_30_DAYS AND metrics.clicks > 0\n    ORDER BY metrics.cost_micros DESC\n    LIMIT 400`,\n  conversion_actions: `\n    SELECT conversion_action.resource_name, conversion_action.id,\n           conversion_action.name, conversion_action.status,\n           conversion_action.type, conversion_action.category,\n           conversion_action.primary_for_goal,\n           conversion_action.counting_type,\n           conversion_action.phone_call_duration_seconds,\n           conversion_action.value_settings.default_value,\n           conversion_action.click_through_lookback_window_days\n    FROM conversion_action\n    WHERE conversion_action.status != 'REMOVED'`,\n  conversions_by_action_14d: `\n    SELECT segments.conversion_action, segments.conversion_action_name,\n           metrics.all_conversions\n    FROM customer\n    WHERE segments.date DURING LAST_14_DAYS`,\n  customer_settings: `\n    SELECT customer.id, customer.descriptive_name,\n           customer.auto_tagging_enabled,\n           customer.conversion_tracking_setting.enhanced_conversions_for_leads_enabled,\n           customer.conversion_tracking_setting.accepted_customer_data_terms\n    FROM customer`,\n};\n\n// ---------- STARTED FROM THE APP? ----------\n// When the Blue Market Ads app starts this workflow, it sends the account\n// to work on. The secret check stops anyone else from triggering it.\nconst body = $input.first()?.json?.body;\nif (body && typeof body === 'object' && body.customer_id) {\n  if (!config.webhook_secret || body.secret !== config.webhook_secret) {\n    throw new Error('Webhook secret does not match. Run refused.');\n  }\n  config.customer_id = String(body.customer_id).replace(/\\D/g, '');\n  config.login_customer_id = String(body.login_customer_id || body.customer_id).replace(/\\D/g, '');\n  config.started_by = body.requested_by || 'Blue Market Ads app';\n  config.account_name = body.account_name || '';\n}\n\nreturn [{ json: config }];\n"
+      },
+      "id": "725eb928-03b0-4742-be8d-e57871751d30",
+      "name": "Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://googleads.googleapis.com/{{ $('Config').first().json.api_version }}/customers/{{ $('Config').first().json.customer_id }}/googleAds:search",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleAdsOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "developer-token",
+              "value": "={{ $('Config').first().json.developer_token }}"
+            },
+            {
+              "name": "login-customer-id",
+              "value": "={{ $('Config').first().json.login_customer_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $('Config').first().json.queries.account_mtd }) }}",
+        "options": {}
+      },
+      "id": "54c9a819-5f0f-459d-935b-d1031efc433d",
+      "name": "Get Account Spend (Month)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://googleads.googleapis.com/{{ $('Config').first().json.api_version }}/customers/{{ $('Config').first().json.customer_id }}/googleAds:search",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleAdsOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "developer-token",
+              "value": "={{ $('Config').first().json.developer_token }}"
+            },
+            {
+              "name": "login-customer-id",
+              "value": "={{ $('Config').first().json.login_customer_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $('Config').first().json.queries.campaigns_mtd }) }}",
+        "options": {}
+      },
+      "id": "17459a33-83f7-41c6-8993-1bfe5e5f3ec6",
+      "name": "Get Campaigns (Month)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://googleads.googleapis.com/{{ $('Config').first().json.api_version }}/customers/{{ $('Config').first().json.customer_id }}/googleAds:search",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleAdsOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "developer-token",
+              "value": "={{ $('Config').first().json.developer_token }}"
+            },
+            {
+              "name": "login-customer-id",
+              "value": "={{ $('Config').first().json.login_customer_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $('Config').first().json.queries.campaigns_today }) }}",
+        "options": {}
+      },
+      "id": "a4a0858b-3c90-46d8-9eac-9d9b44994860",
+      "name": "Get Campaigns (Today)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n//  BUDGET GUARD — runs every few hours. Its only job is protection.\n//\n//  The rule it follows: the robot may make things CHEAPER on its own,\n//  but never more expensive. Lowering a budget or pausing at the monthly\n//  cap is safe to automate; raising spend always waits for a human\n//  (the Daily Optimizer's approval email).\n//\n//  Note: Google may spend up to 2× a daily budget on a single day, but\n//  never more than 30.4× the daily budget over a month. So the real risk\n//  is not one expensive day — it is a month that runs hot, or a client\n//  whose MONTHLY budget is smaller than daily budget × 30.4.\n// =====================================================================\n\nconst cfg = $('Config').first().json;\nconst mtd = $('Get Campaigns (Month)').first().json.results || [];\nconst today = $('Get Campaigns (Today)').first().json.results || [];\nconst n = (v) => Number(v || 0);\nconst usd = (m) => n(m) / 1e6;\nconst money = (x) => '$' + x.toFixed(2);\n\n// Time position inside the month, in the account's timezone\nconst p = Object.fromEntries(new Intl.DateTimeFormat('en-US', {\n  timeZone: cfg.account_timezone, year: 'numeric', month: 'numeric', day: 'numeric',\n  hour: 'numeric', hourCycle: 'h23',\n}).formatToParts(new Date()).map((x) => [x.type, x.value]));\nconst daysInMonth = new Date(n(p.year), n(p.month), 0).getDate();\nconst elapsedDays = (n(p.day) - 1) + n(p.hour) / 24;\nconst daysLeft = Math.max(daysInMonth - elapsedDays, 0.5);\n\n// Account-wide spend (includes campaigns paused earlier this month)\nconst spentMtd = ($('Get Account Spend (Month)').first().json.results || [])\n  .reduce((a, r) => a + usd(r.metrics?.costMicros), 0);\nconst budget = cfg.monthly_budget_total;\nconst projected = elapsedDays > 0.5 ? spentMtd / elapsedDays * daysInMonth : spentMtd;\n\nconst alerts = [];\nconst ops = { 'campaigns:mutate': [], 'campaignBudgets:mutate': [] };\nconst summaries = { 'campaigns:mutate': [], 'campaignBudgets:mutate': [] };\n\n// ---------- 1. HARD STOP: monthly budget reached ----------\nif (spentMtd >= budget) {\n  for (const r of mtd) {\n    ops['campaigns:mutate'].push({ update: { resourceName:\n      `customers/${cfg.customer_id}/campaigns/${r.campaign.id}`, status: 'PAUSED' },\n      updateMask: 'status' });\n    summaries['campaigns:mutate'].push(`Paused ${r.campaign.name} (monthly cap)`);\n  }\n  alerts.push(`MONTHLY CAP HIT: ${money(spentMtd)} spent of ${money(budget)}. ` +\n    `All ${mtd.length} enabled campaigns paused. Re-enable them on the 1st.`);\n}\n\n// ---------- 2. RUNNING HOT: trim budgets so the month lands on target ----------\nelse if (projected > budget * 1.05) {\n  const remaining = Math.max(budget - spentMtd, 0);\n  const seen = new Set();\n  const budgets = [];\n  for (const r of mtd) {\n    const b = r.campaignBudget;\n    if (!b || seen.has(b.resourceName)) continue;\n    seen.add(b.resourceName);\n    budgets.push({ res: b.resourceName, daily: usd(b.amountMicros), name: r.campaign.name });\n  }\n  const totalDaily = budgets.reduce((a, b) => a + b.daily, 0);\n  for (const b of budgets) {\n    const ideal = (remaining * (b.daily / totalDaily)) / daysLeft;\n    const floor = b.daily * (1 - cfg.max_budget_change_pct / 100);\n    const next = Math.max(ideal, floor, 1);\n    if (next < b.daily * 0.95) {            // decreases only\n      const cents = Math.round(next * 100);\n      ops['campaignBudgets:mutate'].push({ update: { resourceName: b.res,\n        amountMicros: String(cents * 10000) }, updateMask: 'amountMicros' });\n      summaries['campaignBudgets:mutate'].push(`${b.name}: daily ${money(b.daily)} → ${money(cents / 100)}`);\n    }\n  }\n  alerts.push(`PACING HIGH: projected ${money(projected)} vs ${money(budget)} budget ` +\n    `(${money(spentMtd)} spent so far). Lowered ${summaries['campaignBudgets:mutate'].length} daily budgets.`);\n}\n\n// ---------- 3. SPIKE: a campaign burning money today with no leads ----------\nfor (const r of today) {\n  const spend = usd(r.metrics?.costMicros);\n  const daily = usd(r.campaignBudget?.amountMicros);\n  if (daily > 0 && spend > daily * 1.5 && n(r.metrics?.conversions) === 0) {\n    alerts.push(`SPIKE: ${r.campaign.name} has spent ${money(spend)} today ` +\n      `(${(spend / daily * 100).toFixed(0)}% of its daily budget) with 0 conversions. ` +\n      `Check search terms and any recent changes.`);\n  }\n}\n\nif (alerts.length === 0) return [];   // nothing wrong -> stay quiet\n\nconst requests = Object.entries(ops).filter(([, list]) => list.length).map(([endpoint, list]) => ({\n  url: `https://googleads.googleapis.com/${cfg.api_version}/customers/${cfg.customer_id}/${endpoint}`,\n  body: { operations: list, partialFailure: true, validateOnly: cfg.dry_run === true },\n  endpoint, summaries: summaries[endpoint],\n}));\n\nreturn [{ json: {\n  subject: `[Budget Guard] ${alerts.length} alert(s)${cfg.dry_run ? ' (dry run — nothing changed)' : ''}`,\n  body: ['BUDGET GUARD', cfg.dry_run ? 'MODE: DRY RUN — protective changes were validated, not applied.' : 'MODE: LIVE',\n    '', ...alerts.map((a) => '• ' + a), '',\n    requests.length ? 'Changes made:\\n' + requests.flatMap((r) => r.summaries).map((s) => '  - ' + s).join('\\n') : 'No automatic changes were needed.',\n  ].join('\\n'),\n  requests,\n} }];\n"
+      },
+      "id": "8cce3494-a935-46cd-bd25-c98bfe12358a",
+      "name": "Guard Logic",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "={{ $('Config').first().json.approver_email }}",
+        "subject": "={{ $json.subject }}",
+        "emailType": "text",
+        "message": "={{ $json.body }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "80a196a6-3581-41d8-808f-51d965eba83e",
+      "name": "Send Alert",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1440,
+        300
+      ],
+      "webhookId": "a31d67f9-5faf-4633-8e69-0cd0503633d0"
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n//  BUILD API REQUESTS — turns the list of planned requests into one n8n\n//  item per request, so the HTTP node below runs once for each.\n//  If there are no changes, returning [] ends the workflow quietly.\n// =====================================================================\nconst { requests } = $('Guard Logic').first().json;\nreturn (requests || []).map((r) => ({ json: r }));\n"
+      },
+      "id": "9debe82e-d768-4670-9928-aab2dcf98aea",
+      "name": "Build API Requests",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleAdsOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "developer-token",
+              "value": "={{ $('Config').first().json.developer_token }}"
+            },
+            {
+              "name": "login-customer-id",
+              "value": "={{ $('Config').first().json.login_customer_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {}
+      },
+      "id": "f4483750-714c-4424-a741-6a0adb381c89",
+      "name": "Apply to Google Ads",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1920,
+        300
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n//  LOG RESULTS — one spreadsheet row per change, so you have a full\n//  history of what the system did, when, and whether Google accepted it.\n// =====================================================================\n\nconst cfg = $('Config').first().json;\nconst requests = $('Build API Requests').all();\nconst responses = $input.all();\nconst rows = [];\nconst now = new Date().toISOString();\n\nrequests.forEach((req, i) => {\n  const res = responses[i]?.json || {};\n  const results = res.results || [];\n  const httpError = res.error ? (res.error.message || JSON.stringify(res.error)).slice(0, 300) : '';\n  // With partialFailure, failed operations come back as empty {} results.\n  const pfErrors = (res.partialFailureError?.details || [])\n    .flatMap((d) => d.errors || []).map((e) => e.message);\n\n  req.json.summaries.forEach((summary, j) => {\n    const ok = !httpError && results[j] && Object.keys(results[j]).length > 0;\n    rows.push({ json: {\n      timestamp: now,\n      mode: cfg.dry_run ? 'DRY RUN' : 'LIVE',\n      customer_id: cfg.customer_id,\n      endpoint: req.json.endpoint,\n      change: summary,\n      status: httpError ? 'ERROR' : (ok || cfg.dry_run && !pfErrors.length ? 'OK' : 'FAILED'),\n      detail: httpError || (ok ? (results[j].resourceName || '') : (pfErrors.shift() || '')),\n    } });\n  });\n});\nreturn rows;\n"
+      },
+      "id": "797b14d2-21b4-488d-ba25-8cdc1698cf28",
+      "name": "Log Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "url",
+          "value": "={{ $('Config').first().json.sheet_url }}"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $('Config').first().json.log_sheet_tab }}"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "c11f9c1a-2288-42d0-b2f1-ee7278a1a991",
+      "name": "Write Change Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        2400,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Budget Guard\nRuns every 3 hours. Silent unless something is wrong.\n\n**Can do on its own:** lower daily budgets when the month is pacing hot; pause campaigns when the monthly cap is hit.\n**Never does:** raise spend. Increases go through the Daily Optimizer approval email.",
+        "width": 1000,
+        "height": 250,
+        "color": 3
+      },
+      "id": "31aa8694-eb62-4e37-aa46-ef2c434e73c4",
+      "name": "Note f96ad2",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        200,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "blue-market-budget-guard",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "5d70c8a6-311e-4369-9e01-17a4bb58cc72",
+      "name": "Started from App",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        520
+      ],
+      "webhookId": "741f61ed-626c-4316-b260-2c42c21bdc04"
+    }
+  ],
+  "connections": {
+    "Every 3 Hours": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Get Account Spend (Month)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Account Spend (Month)": {
+      "main": [
+        [
+          {
+            "node": "Get Campaigns (Month)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Campaigns (Month)": {
+      "main": [
+        [
+          {
+            "node": "Get Campaigns (Today)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Campaigns (Today)": {
+      "main": [
+        [
+          {
+            "node": "Guard Logic",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Guard Logic": {
+      "main": [
+        [
+          {
+            "node": "Send Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Alert": {
+      "main": [
+        [
+          {
+            "node": "Build API Requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build API Requests": {
+      "main": [
+        [
+          {
+            "node": "Apply to Google Ads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply to Google Ads": {
+      "main": [
+        [
+          {
+            "node": "Log Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Results": {
+      "main": [
+        [
+          {
+            "node": "Write Change Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Started from App": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Los_Angeles",
+    "saveManualExecutions": true
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

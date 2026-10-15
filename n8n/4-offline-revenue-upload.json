@@ -1,0 +1,277 @@
+{
+  "name": "Google Ads 4 — Offline Revenue Upload (Lead Sheet → Ads)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "10 21 * * *"
+            }
+          ]
+        }
+      },
+      "id": "ea5f764e-063d-461d-b5db-469b794558ef",
+      "name": "Nightly 9:10pm",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n//  CONFIG  —  the only node you should need to edit.\n//  The same Config node is used in all four workflows. Edit it once,\n//  then copy/paste the node into the other three so they stay in sync.\n//\n//  WHY a Code node instead of a \"Set\" node: it lets every setting carry\n//  a comment explaining what it does, and it can hold lists and objects.\n// =====================================================================\n\nconst config = {\n  // ---------- ACCOUNT ----------\n  // Google Ads customer ID of the CLIENT account, digits only (no dashes).\n  customer_id: '1234567890',\n  // Your manager (MCC) account ID, digits only. Required when you reach the\n  // client account through a manager account (the normal agency setup).\n  login_customer_id: '0987654321',\n  // Developer token from Google Ads > Tools > API Center (in the MCC).\n  // Better: store it as an n8n Variable and use $vars.GOOGLE_ADS_DEV_TOKEN.\n  developer_token: 'PASTE_DEVELOPER_TOKEN_HERE',\n  // Google ships a new API version roughly monthly; each major version lives\n  // about a year. If requests start failing with \"version not found\",\n  // bump this (v25 is supported into Aug 2027).\n  api_version: 'v25',\n  account_timezone: 'America/Los_Angeles',\n  currency: 'USD',\n\n  // ---------- SAFETY SWITCHES ----------\n  // DRY RUN = true: every change is sent with validateOnly, so Google CHECKS\n  // it but changes nothing. Leave this on for the first 1–2 weeks and read\n  // the logs. Flip to false only once the proposals look right to you.\n  dry_run: true,\n  approver_email: 'you@example.com',\n  // Shared secret for runs started from the Blue Market Ads app.\n  // Must match N8N_WEBHOOK_SECRET in Vercel.\n  webhook_secret: 'PASTE_THE_SAME_SECRET_AS_VERCEL',\n  // Hard limits the robot can never exceed, no matter what the math says.\n  max_bid_increase_pct: 15,      // per run, per keyword\n  max_bid_decrease_pct: 25,      // per run, per keyword\n  max_cpc_ceiling: 25.00,        // absolute max bid in dollars\n  min_cpc_floor: 0.50,\n  max_budget_change_pct: 25,     // per run, per budget\n  max_changes_per_run: 40,       // stops a bad run from doing 500 edits\n\n  // ---------- BUSINESS GOALS (Firm Media baseline) ----------\n  monthly_budget_total: 3000,    // client's monthly ad budget, in dollars\n  target_cpa: 250,               // baseline cost per lead\n  // Campaigns whose name contains a key get their own CPA target.\n  // High-value procedures can afford more per lead; low-margin ones less.\n  cpa_overrides: {\n    'All-on-4': 600,\n    'Implant': 450,\n    'Cleaning': 120,\n  },\n  target_ctr: 0.07,              // 7% CTR benchmark\n  call_min_seconds: 60,          // calls shorter than this are not leads\n  // Bid strategy ladder thresholds (conversions in last 30 days)\n  conv_for_max_conversions: 15,\n  conv_for_target_cpa: 30,\n\n  // ---------- DECISION THRESHOLDS ----------\n  // How much a keyword may spend with zero conversions before action.\n  // Expressed as a multiple of the campaign's target CPA.\n  zero_conv_reduce_at: 1.0,      // lower its bid\n  zero_conv_pause_at: 1.5,       // propose pausing it\n  min_impr_for_ctr_check: 200,\n  min_impr_for_qs_check: 100,\n  odd_penny_bids: true,          // $12.00 -> $12.01 (tie-breaker habit)\n\n  // ---------- AI SEARCH-TERM REVIEW ----------\n  anthropic_model: 'claude-sonnet-5-5',\n  // Tell Claude what the business sells so it can judge search intent.\n  business_context:\n    'Dental/periodontal practice. Sells: dental implants, All-on-4, gum ' +\n    'grafting, periodontal treatment, cleanings. Wants new-patient ' +\n    'consultations in the local service area. Does NOT want job seekers, ' +\n    'students, DIY/home remedy seekers, or people looking for free care.',\n  // Search terms containing these are always proposed as negatives.\n  negative_seed_terms: [\n    'job', 'jobs', 'career', 'careers', 'salary', 'hiring', 'school',\n    'course', 'training', 'certification', 'free', 'diy', 'home remedy',\n    'reddit', 'youtube', 'wikipedia', 'pdf', 'definition', 'meaning',\n    'cartoon', 'clipart',\n  ],\n\n  // ---------- GOOGLE SHEET (change log + lead evaluation) ----------\n  // One spreadsheet with two tabs: \"Change Log\" and \"Leads\".\n  sheet_url: 'https://docs.google.com/spreadsheets/d/PASTE_SHEET_ID/edit',\n  log_sheet_tab: 'Change Log',\n  lead_sheet_tab: 'Leads',\n\n  // ---------- OFFLINE REVENUE (Workflow 4) ----------\n  // Map each lead stage in the sheet to a conversion action ID\n  // (Google Ads > Goals > Conversions > click the action > ID in the URL \"ctId=\").\n  // Workflow 3 can create these three actions for you.\n  stage_to_conversion_action: {\n    'Qualified Lead': '111111111',\n    'Booked Consult': '222222222',\n    'Closed - Revenue': '333333333',\n  },\n  // Offset of the sheet's timestamps from UTC (PDT = -07:00, PST = -08:00).\n  sheet_utc_offset: '-07:00',\n};\n\n// ---------- GAQL QUERIES (Google Ads Query Language) ----------\n// Think of these as SQL for your ad account. You rarely need to edit them.\nconfig.queries = {\n  // Whole-account spend this month — includes paused/removed campaigns,\n  // because that money counts against the client's budget too.\n  account_mtd: `\n    SELECT metrics.cost_micros, metrics.conversions\n    FROM customer\n    WHERE segments.date DURING THIS_MONTH`,\n  campaigns_mtd: `\n    SELECT campaign.id, campaign.name, campaign.status,\n           campaign.advertising_channel_type, campaign.bidding_strategy_type,\n           campaign.target_spend.cpc_bid_ceiling_micros,\n           campaign_budget.resource_name, campaign_budget.amount_micros,\n           campaign_budget.explicitly_shared,\n           metrics.cost_micros, metrics.clicks, metrics.impressions,\n           metrics.conversions, metrics.conversions_value,\n           metrics.search_impression_share,\n           metrics.search_budget_lost_impression_share,\n           metrics.search_rank_lost_impression_share, metrics.average_cpc\n    FROM campaign\n    WHERE segments.date DURING THIS_MONTH AND campaign.status = 'ENABLED'`,\n  campaigns_30d: `\n    SELECT campaign.id, metrics.cost_micros, metrics.clicks,\n           metrics.conversions, metrics.conversions_value\n    FROM campaign\n    WHERE segments.date DURING LAST_30_DAYS AND campaign.status = 'ENABLED'`,\n  campaigns_today: `\n    SELECT campaign.id, campaign.name, campaign_budget.resource_name,\n           campaign_budget.amount_micros, metrics.cost_micros,\n           metrics.conversions, metrics.clicks\n    FROM campaign\n    WHERE segments.date DURING TODAY AND campaign.status = 'ENABLED'`,\n  keywords_30d: `\n    SELECT campaign.id, campaign.name, ad_group.id, ad_group.name,\n           ad_group_criterion.resource_name, ad_group_criterion.criterion_id,\n           ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type,\n           ad_group_criterion.cpc_bid_micros,\n           ad_group_criterion.effective_cpc_bid_micros,\n           ad_group_criterion.quality_info.quality_score,\n           ad_group_criterion.quality_info.creative_quality_score,\n           ad_group_criterion.quality_info.post_click_quality_score,\n           ad_group_criterion.quality_info.search_predicted_ctr,\n           metrics.impressions, metrics.clicks, metrics.cost_micros,\n           metrics.conversions, metrics.ctr, metrics.average_cpc,\n           metrics.search_rank_lost_impression_share\n    FROM keyword_view\n    WHERE segments.date DURING LAST_30_DAYS\n      AND ad_group_criterion.status = 'ENABLED'\n      AND ad_group.status = 'ENABLED' AND campaign.status = 'ENABLED'`,\n  search_terms_30d: `\n    SELECT campaign.id, campaign.name, ad_group.id,\n           search_term_view.search_term, search_term_view.status,\n           metrics.impressions, metrics.clicks, metrics.cost_micros,\n           metrics.conversions\n    FROM search_term_view\n    WHERE segments.date DURING LAST_30_DAYS AND metrics.clicks > 0\n    ORDER BY metrics.cost_micros DESC\n    LIMIT 400`,\n  conversion_actions: `\n    SELECT conversion_action.resource_name, conversion_action.id,\n           conversion_action.name, conversion_action.status,\n           conversion_action.type, conversion_action.category,\n           conversion_action.primary_for_goal,\n           conversion_action.counting_type,\n           conversion_action.phone_call_duration_seconds,\n           conversion_action.value_settings.default_value,\n           conversion_action.click_through_lookback_window_days\n    FROM conversion_action\n    WHERE conversion_action.status != 'REMOVED'`,\n  conversions_by_action_14d: `\n    SELECT segments.conversion_action, segments.conversion_action_name,\n           metrics.all_conversions\n    FROM customer\n    WHERE segments.date DURING LAST_14_DAYS`,\n  customer_settings: `\n    SELECT customer.id, customer.descriptive_name,\n           customer.auto_tagging_enabled,\n           customer.conversion_tracking_setting.enhanced_conversions_for_leads_enabled,\n           customer.conversion_tracking_setting.accepted_customer_data_terms\n    FROM customer`,\n};\n\n// ---------- STARTED FROM THE APP? ----------\n// When the Blue Market Ads app starts this workflow, it sends the account\n// to work on. The secret check stops anyone else from triggering it.\nconst body = $input.first()?.json?.body;\nif (body && typeof body === 'object' && body.customer_id) {\n  if (!config.webhook_secret || body.secret !== config.webhook_secret) {\n    throw new Error('Webhook secret does not match. Run refused.');\n  }\n  config.customer_id = String(body.customer_id).replace(/\\D/g, '');\n  config.login_customer_id = String(body.login_customer_id || body.customer_id).replace(/\\D/g, '');\n  config.started_by = body.requested_by || 'Blue Market Ads app';\n  config.account_name = body.account_name || '';\n}\n\nreturn [{ json: config }];\n"
+      },
+      "id": "aa28bce2-cb27-47b5-9ac1-b012e2269402",
+      "name": "Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "mode": "url",
+          "value": "={{ $('Config').first().json.sheet_url }}"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $('Config').first().json.lead_sheet_tab }}"
+        },
+        "options": {}
+      },
+      "id": "126e3e52-11b8-4dba-a971-e5ec80d5e90c",
+      "name": "Read Lead Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        480,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n//  OFFLINE REVENUE UPLOAD — closes the \"we don't know ROAS\" gap.\n//\n//  HOW IT WORKS: when someone clicks an ad, Google adds a unique ID to\n//  the landing page URL (the gclid). The landing-page form saves it in a\n//  hidden field. When the office later marks that lead \"Booked Consult\"\n//  or \"Closed - Revenue $8,500\" in the sheet, this workflow sends the\n//  gclid + stage + revenue back to Google. Now Google Ads knows which\n//  keyword produced which revenue — and Smart Bidding can optimize for\n//  REVENUE instead of raw form fills.\n//\n//  SHEET COLUMNS (one row per lead per stage — add a new row when a lead\n//  moves to a new stage):\n//    row_id | gclid | gbraid | stage | stage_date | revenue | uploaded_at | upload_status\n//  row_id must be unique, e.g. \"L1042-booked\". stage_date like\n//  \"2026-10-14 15:30\". gbraid is optional (iPhone clicks sometimes carry\n//  gbraid instead of gclid).\n// =====================================================================\n\nconst cfg = $('Config').first().json;\nconst rows = $input.all().map((i) => i.json);\nconst cid = cfg.customer_id;\n\n// \"2026-10-14 15:30\" -> \"2026-10-14 15:30:00-07:00\" (Google's required format)\nfunction toGoogleTime(s) {\n  const str = String(s || '').trim().replace('T', ' ');\n  const m = str.match(/^(\\d{4}-\\d{2}-\\d{2})(?:\\s+(\\d{1,2}):(\\d{2})(?::(\\d{2}))?)?/);\n  if (!m) return null;\n  const hh = (m[2] || '12').padStart(2, '0'), mm = m[3] || '00', ss = m[4] || '00';\n  return `${m[1]} ${hh}:${mm}:${ss}${cfg.sheet_utc_offset}`;\n}\n\nconst conversions = [], rowIds = [], skipped = [];\nfor (const r of rows) {\n  if (r.uploaded_at) continue;                       // already sent\n  const actionId = cfg.stage_to_conversion_action[String(r.stage || '').trim()];\n  const when = toGoogleTime(r.stage_date);\n  const clickId = String(r.gclid || '').trim();\n  const braid = String(r.gbraid || '').trim();\n  if (!actionId || !when || (!clickId && !braid)) {\n    if (r.row_id) skipped.push({ row_id: r.row_id,\n      reason: !actionId ? 'unknown stage' : !when ? 'bad stage_date' : 'no gclid/gbraid' });\n    continue;\n  }\n  const conv = {\n    conversionAction: `customers/${cid}/conversionActions/${actionId}`,\n    conversionDateTime: when,\n    currencyCode: cfg.currency,\n  };\n  if (clickId) conv.gclid = clickId; else conv.gbraid = braid;\n  const value = Number(String(r.revenue || '').replace(/[$,]/g, ''));\n  if (value > 0) conv.conversionValue = value;\n  conversions.push(conv);\n  rowIds.push(r.row_id);\n}\n\nif (conversions.length === 0 && skipped.length === 0) return [];\n\nreturn [{ json: {\n  url: `https://googleads.googleapis.com/${cfg.api_version}/customers/${cid}:uploadClickConversions`,\n  // partialFailure MUST be true for this endpoint.\n  body: { conversions: conversions.slice(0, 2000), partialFailure: true, validateOnly: cfg.dry_run === true },\n  row_ids: rowIds.slice(0, 2000),\n  skipped,\n  has_uploads: conversions.length > 0,\n} }];\n"
+      },
+      "id": "0a54049d-94ef-4676-aee3-39008d872405",
+      "name": "Build Uploads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleAdsOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "developer-token",
+              "value": "={{ $('Config').first().json.developer_token }}"
+            },
+            {
+              "name": "login-customer-id",
+              "value": "={{ $('Config').first().json.login_customer_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {}
+      },
+      "id": "4829f2fe-a2c1-466f-ad09-b8ae47664faa",
+      "name": "Upload to Google Ads",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        300
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n//  MARK ROWS — writes the result back into the sheet so each lead is\n//  uploaded exactly once. Successful rows get a timestamp; failed rows\n//  keep it blank (they retry tomorrow) and get the error message.\n// =====================================================================\n\nconst cfg = $('Config').first().json;\nconst built = $('Build Uploads').first().json;\nconst res = $input.first().json || {};\nconst results = res.results || [];\nconst now = new Date().toISOString();\nconst out = [];\n\nbuilt.row_ids.forEach((rowId, i) => {\n  // With partialFailure, failed conversions come back as empty {} results.\n  const ok = !res.error && (cfg.dry_run ? !res.partialFailureError : results[i] && Object.keys(results[i]).length > 0);\n  out.push({ json: {\n    row_id: rowId,\n    uploaded_at: ok && !cfg.dry_run ? now : '',\n    upload_status: res.error ? 'ERROR: ' + (res.error.message || '').slice(0, 150)\n      : ok ? (cfg.dry_run ? 'DRY RUN OK' : 'UPLOADED') : 'FAILED — check gclid/date (must be after the click, within 90 days)',\n  } });\n});\nfor (const s of built.skipped) out.push({ json: { row_id: s.row_id, uploaded_at: '', upload_status: 'SKIPPED: ' + s.reason } });\nreturn out;\n"
+      },
+      "id": "af6300c9-fe37-4028-9221-556491a32144",
+      "name": "Mark Rows",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "mode": "url",
+          "value": "={{ $('Config').first().json.sheet_url }}"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $('Config').first().json.lead_sheet_tab }}"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "row_id"
+          ],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "5557c82f-6983-49bc-809a-e385cfae894f",
+      "name": "Update Lead Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1440,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Offline Revenue → ROAS\nThe office fills in the **Leads** tab (one row per lead per stage). Each night this sends gclid + stage + revenue to Google Ads, then stamps the row so it is never sent twice.\n\nColumns: `row_id | gclid | gbraid | stage | stage_date | revenue | uploaded_at | upload_status`",
+        "width": 1240,
+        "height": 250,
+        "color": 6
+      },
+      "id": "391a671c-24cf-45e8-abac-7dcaf7568365",
+      "name": "Note 3dbed3",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "blue-market-revenue-upload",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "c65f134d-d906-4716-a1bb-8a0189ddd645",
+      "name": "Started from App",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        520
+      ],
+      "webhookId": "3d26140c-aa0c-4d34-953f-af09cc79139e"
+    }
+  ],
+  "connections": {
+    "Nightly 9:10pm": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Read Lead Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Lead Sheet": {
+      "main": [
+        [
+          {
+            "node": "Build Uploads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Uploads": {
+      "main": [
+        [
+          {
+            "node": "Upload to Google Ads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upload to Google Ads": {
+      "main": [
+        [
+          {
+            "node": "Mark Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Rows": {
+      "main": [
+        [
+          {
+            "node": "Update Lead Sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Started from App": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Los_Angeles",
+    "saveManualExecutions": true
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

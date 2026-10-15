@@ -64,9 +64,9 @@ Then set `TEAM_USERS` (one line):
 
 ## Connect n8n
 
-The four workflow files in the n8n package now have a second trigger, **Started from App** (a webhook). To connect them:
+The four workflow files are in the `n8n/` folder of this repo, along with the Google Sheet template. Each has a second trigger, **Started from App** (a webhook). To connect them:
 
-1. Re-import the updated workflow files (or add the webhook node and the new Config section to your existing ones).
+1. In n8n, choose **Workflows → Import from File** for each JSON in `n8n/` (or add the webhook node and the new Config section to workflows you already imported).
 2. In each workflow's **Config** node, set `webhook_secret` to the same value as `N8N_WEBHOOK_SECRET`.
 3. Activate the workflows. Their webhook URLs are `<N8N_WEBHOOK_BASE>/blue-market-optimizer`, `/blue-market-budget-guard`, `/blue-market-conversion-audit` and `/blue-market-revenue-upload`.
 4. In Vercel, set `N8N_WEBHOOK_BASE` and `N8N_WEBHOOK_SECRET`, then redeploy.

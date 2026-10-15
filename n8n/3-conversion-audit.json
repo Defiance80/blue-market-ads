@@ -1,0 +1,438 @@
+{
+  "name": "Google Ads 3 — Conversion Tracking Audit + Setup",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "20 7 * * 1"
+            }
+          ]
+        }
+      },
+      "id": "316744d9-22d7-4382-b0fb-90f669b177f4",
+      "name": "Mondays 7:20am",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n//  CONFIG  —  the only node you should need to edit.\n//  The same Config node is used in all four workflows. Edit it once,\n//  then copy/paste the node into the other three so they stay in sync.\n//\n//  WHY a Code node instead of a \"Set\" node: it lets every setting carry\n//  a comment explaining what it does, and it can hold lists and objects.\n// =====================================================================\n\nconst config = {\n  // ---------- ACCOUNT ----------\n  // Google Ads customer ID of the CLIENT account, digits only (no dashes).\n  customer_id: '1234567890',\n  // Your manager (MCC) account ID, digits only. Required when you reach the\n  // client account through a manager account (the normal agency setup).\n  login_customer_id: '0987654321',\n  // Developer token from Google Ads > Tools > API Center (in the MCC).\n  // Better: store it as an n8n Variable and use $vars.GOOGLE_ADS_DEV_TOKEN.\n  developer_token: 'PASTE_DEVELOPER_TOKEN_HERE',\n  // Google ships a new API version roughly monthly; each major version lives\n  // about a year. If requests start failing with \"version not found\",\n  // bump this (v25 is supported into Aug 2027).\n  api_version: 'v25',\n  account_timezone: 'America/Los_Angeles',\n  currency: 'USD',\n\n  // ---------- SAFETY SWITCHES ----------\n  // DRY RUN = true: every change is sent with validateOnly, so Google CHECKS\n  // it but changes nothing. Leave this on for the first 1–2 weeks and read\n  // the logs. Flip to false only once the proposals look right to you.\n  dry_run: true,\n  approver_email: 'you@example.com',\n  // Shared secret for runs started from the Blue Market Ads app.\n  // Must match N8N_WEBHOOK_SECRET in Vercel.\n  webhook_secret: 'PASTE_THE_SAME_SECRET_AS_VERCEL',\n  // Hard limits the robot can never exceed, no matter what the math says.\n  max_bid_increase_pct: 15,      // per run, per keyword\n  max_bid_decrease_pct: 25,      // per run, per keyword\n  max_cpc_ceiling: 25.00,        // absolute max bid in dollars\n  min_cpc_floor: 0.50,\n  max_budget_change_pct: 25,     // per run, per budget\n  max_changes_per_run: 40,       // stops a bad run from doing 500 edits\n\n  // ---------- BUSINESS GOALS (Firm Media baseline) ----------\n  monthly_budget_total: 3000,    // client's monthly ad budget, in dollars\n  target_cpa: 250,               // baseline cost per lead\n  // Campaigns whose name contains a key get their own CPA target.\n  // High-value procedures can afford more per lead; low-margin ones less.\n  cpa_overrides: {\n    'All-on-4': 600,\n    'Implant': 450,\n    'Cleaning': 120,\n  },\n  target_ctr: 0.07,              // 7% CTR benchmark\n  call_min_seconds: 60,          // calls shorter than this are not leads\n  // Bid strategy ladder thresholds (conversions in last 30 days)\n  conv_for_max_conversions: 15,\n  conv_for_target_cpa: 30,\n\n  // ---------- DECISION THRESHOLDS ----------\n  // How much a keyword may spend with zero conversions before action.\n  // Expressed as a multiple of the campaign's target CPA.\n  zero_conv_reduce_at: 1.0,      // lower its bid\n  zero_conv_pause_at: 1.5,       // propose pausing it\n  min_impr_for_ctr_check: 200,\n  min_impr_for_qs_check: 100,\n  odd_penny_bids: true,          // $12.00 -> $12.01 (tie-breaker habit)\n\n  // ---------- AI SEARCH-TERM REVIEW ----------\n  anthropic_model: 'claude-sonnet-5-5',\n  // Tell Claude what the business sells so it can judge search intent.\n  business_context:\n    'Dental/periodontal practice. Sells: dental implants, All-on-4, gum ' +\n    'grafting, periodontal treatment, cleanings. Wants new-patient ' +\n    'consultations in the local service area. Does NOT want job seekers, ' +\n    'students, DIY/home remedy seekers, or people looking for free care.',\n  // Search terms containing these are always proposed as negatives.\n  negative_seed_terms: [\n    'job', 'jobs', 'career', 'careers', 'salary', 'hiring', 'school',\n    'course', 'training', 'certification', 'free', 'diy', 'home remedy',\n    'reddit', 'youtube', 'wikipedia', 'pdf', 'definition', 'meaning',\n    'cartoon', 'clipart',\n  ],\n\n  // ---------- GOOGLE SHEET (change log + lead evaluation) ----------\n  // One spreadsheet with two tabs: \"Change Log\" and \"Leads\".\n  sheet_url: 'https://docs.google.com/spreadsheets/d/PASTE_SHEET_ID/edit',\n  log_sheet_tab: 'Change Log',\n  lead_sheet_tab: 'Leads',\n\n  // ---------- OFFLINE REVENUE (Workflow 4) ----------\n  // Map each lead stage in the sheet to a conversion action ID\n  // (Google Ads > Goals > Conversions > click the action > ID in the URL \"ctId=\").\n  // Workflow 3 can create these three actions for you.\n  stage_to_conversion_action: {\n    'Qualified Lead': '111111111',\n    'Booked Consult': '222222222',\n    'Closed - Revenue': '333333333',\n  },\n  // Offset of the sheet's timestamps from UTC (PDT = -07:00, PST = -08:00).\n  sheet_utc_offset: '-07:00',\n};\n\n// ---------- GAQL QUERIES (Google Ads Query Language) ----------\n// Think of these as SQL for your ad account. You rarely need to edit them.\nconfig.queries = {\n  // Whole-account spend this month — includes paused/removed campaigns,\n  // because that money counts against the client's budget too.\n  account_mtd: `\n    SELECT metrics.cost_micros, metrics.conversions\n    FROM customer\n    WHERE segments.date DURING THIS_MONTH`,\n  campaigns_mtd: `\n    SELECT campaign.id, campaign.name, campaign.status,\n           campaign.advertising_channel_type, campaign.bidding_strategy_type,\n           campaign.target_spend.cpc_bid_ceiling_micros,\n           campaign_budget.resource_name, campaign_budget.amount_micros,\n           campaign_budget.explicitly_shared,\n           metrics.cost_micros, metrics.clicks, metrics.impressions,\n           metrics.conversions, metrics.conversions_value,\n           metrics.search_impression_share,\n           metrics.search_budget_lost_impression_share,\n           metrics.search_rank_lost_impression_share, metrics.average_cpc\n    FROM campaign\n    WHERE segments.date DURING THIS_MONTH AND campaign.status = 'ENABLED'`,\n  campaigns_30d: `\n    SELECT campaign.id, metrics.cost_micros, metrics.clicks,\n           metrics.conversions, metrics.conversions_value\n    FROM campaign\n    WHERE segments.date DURING LAST_30_DAYS AND campaign.status = 'ENABLED'`,\n  campaigns_today: `\n    SELECT campaign.id, campaign.name, campaign_budget.resource_name,\n           campaign_budget.amount_micros, metrics.cost_micros,\n           metrics.conversions, metrics.clicks\n    FROM campaign\n    WHERE segments.date DURING TODAY AND campaign.status = 'ENABLED'`,\n  keywords_30d: `\n    SELECT campaign.id, campaign.name, ad_group.id, ad_group.name,\n           ad_group_criterion.resource_name, ad_group_criterion.criterion_id,\n           ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type,\n           ad_group_criterion.cpc_bid_micros,\n           ad_group_criterion.effective_cpc_bid_micros,\n           ad_group_criterion.quality_info.quality_score,\n           ad_group_criterion.quality_info.creative_quality_score,\n           ad_group_criterion.quality_info.post_click_quality_score,\n           ad_group_criterion.quality_info.search_predicted_ctr,\n           metrics.impressions, metrics.clicks, metrics.cost_micros,\n           metrics.conversions, metrics.ctr, metrics.average_cpc,\n           metrics.search_rank_lost_impression_share\n    FROM keyword_view\n    WHERE segments.date DURING LAST_30_DAYS\n      AND ad_group_criterion.status = 'ENABLED'\n      AND ad_group.status = 'ENABLED' AND campaign.status = 'ENABLED'`,\n  search_terms_30d: `\n    SELECT campaign.id, campaign.name, ad_group.id,\n           search_term_view.search_term, search_term_view.status,\n           metrics.impressions, metrics.clicks, metrics.cost_micros,\n           metrics.conversions\n    FROM search_term_view\n    WHERE segments.date DURING LAST_30_DAYS AND metrics.clicks > 0\n    ORDER BY metrics.cost_micros DESC\n    LIMIT 400`,\n  conversion_actions: `\n    SELECT conversion_action.resource_name, conversion_action.id,\n           conversion_action.name, conversion_action.status,\n           conversion_action.type, conversion_action.category,\n           conversion_action.primary_for_goal,\n           conversion_action.counting_type,\n           conversion_action.phone_call_duration_seconds,\n           conversion_action.value_settings.default_value,\n           conversion_action.click_through_lookback_window_days\n    FROM conversion_action\n    WHERE conversion_action.status != 'REMOVED'`,\n  conversions_by_action_14d: `\n    SELECT segments.conversion_action, segments.conversion_action_name,\n           metrics.all_conversions\n    FROM customer\n    WHERE segments.date DURING LAST_14_DAYS`,\n  customer_settings: `\n    SELECT customer.id, customer.descriptive_name,\n           customer.auto_tagging_enabled,\n           customer.conversion_tracking_setting.enhanced_conversions_for_leads_enabled,\n           customer.conversion_tracking_setting.accepted_customer_data_terms\n    FROM customer`,\n};\n\n// ---------- STARTED FROM THE APP? ----------\n// When the Blue Market Ads app starts this workflow, it sends the account\n// to work on. The secret check stops anyone else from triggering it.\nconst body = $input.first()?.json?.body;\nif (body && typeof body === 'object' && body.customer_id) {\n  if (!config.webhook_secret || body.secret !== config.webhook_secret) {\n    throw new Error('Webhook secret does not match. Run refused.');\n  }\n  config.customer_id = String(body.customer_id).replace(/\\D/g, '');\n  config.login_customer_id = String(body.login_customer_id || body.customer_id).replace(/\\D/g, '');\n  config.started_by = body.requested_by || 'Blue Market Ads app';\n  config.account_name = body.account_name || '';\n}\n\nreturn [{ json: config }];\n"
+      },
+      "id": "a45e8bba-724f-473d-a9d0-9f4c8e7d74d1",
+      "name": "Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://googleads.googleapis.com/{{ $('Config').first().json.api_version }}/customers/{{ $('Config').first().json.customer_id }}/googleAds:search",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleAdsOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "developer-token",
+              "value": "={{ $('Config').first().json.developer_token }}"
+            },
+            {
+              "name": "login-customer-id",
+              "value": "={{ $('Config').first().json.login_customer_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $('Config').first().json.queries.customer_settings }) }}",
+        "options": {}
+      },
+      "id": "72504f3e-13ee-4b72-8b0e-078e60574a09",
+      "name": "Get Account Settings",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://googleads.googleapis.com/{{ $('Config').first().json.api_version }}/customers/{{ $('Config').first().json.customer_id }}/googleAds:search",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleAdsOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "developer-token",
+              "value": "={{ $('Config').first().json.developer_token }}"
+            },
+            {
+              "name": "login-customer-id",
+              "value": "={{ $('Config').first().json.login_customer_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $('Config').first().json.queries.conversion_actions }) }}",
+        "options": {}
+      },
+      "id": "2fad98cf-3764-4c42-93fd-dbb5a365f774",
+      "name": "Get Conversion Actions",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://googleads.googleapis.com/{{ $('Config').first().json.api_version }}/customers/{{ $('Config').first().json.customer_id }}/googleAds:search",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleAdsOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "developer-token",
+              "value": "={{ $('Config').first().json.developer_token }}"
+            },
+            {
+              "name": "login-customer-id",
+              "value": "={{ $('Config').first().json.login_customer_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query: $('Config').first().json.queries.conversions_by_action_14d }) }}",
+        "options": {}
+      },
+      "id": "a8808296-eb22-41db-8bd6-cbce099a326e",
+      "name": "Get Conversions by Action (14d)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        300
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n//  CONVERSION TRACKING AUDIT + SETUP\n//\n//  WHY this matters more than anything else in the system: every bid,\n//  pause and budget decision is based on \"conversions\". If tracking\n//  counts robocalls, double-counts forms, or silently breaks, the\n//  optimizer confidently makes the WRONG changes. Garbage in, garbage out.\n//\n//  Checks run weekly. Fixes are only proposed in the email unless\n//  auto_fix_conversion_settings is turned on below.\n// =====================================================================\n\nconst cfg = $('Config').first().json;\nconst AUTO_FIX = false;   // set true to let this workflow apply the fixes\nconst actions = $('Get Conversion Actions').first().json.results || [];\nconst recent = $('Get Conversions by Action (14d)').first().json.results || [];\nconst cust = ($('Get Account Settings').first().json.results || [])[0]?.customer || {};\nconst cid = cfg.customer_id;\n\nconst issues = [], ok = [], fixes = [], fixSummaries = [];\nconst recentCount = {};\nfor (const r of recent) {\n  const name = r.segments?.conversionActionName;\n  recentCount[name] = (recentCount[name] || 0) + Number(r.metrics?.allConversions || 0);\n}\n\n// ---------- account-level settings ----------\nif (cust.autoTaggingEnabled === false) {\n  issues.push('AUTO-TAGGING IS OFF. Without it there is no gclid on clicks, so offline ' +\n    'revenue (Workflow 4) cannot be matched to ads. Turn on: Admin > Account settings > Auto-tagging.');\n} else ok.push('Auto-tagging on');\n\nif (!cust.conversionTrackingSetting?.enhancedConversionsForLeadsEnabled) {\n  issues.push('Enhanced conversions for leads is OFF. It matches form leads to ads using a ' +\n    'hashed email/phone, recovering conversions that cookies miss (iOS, consent banners). ' +\n    'Turn on in Goals > Settings and accept the customer data terms.');\n}\n\n// ---------- per conversion action ----------\nconst enabled = actions.map((r) => r.conversionAction).filter((a) => a.status === 'ENABLED');\nconst primary = enabled.filter((a) => a.primaryForGoal);\nif (enabled.length === 0) issues.push('NO ENABLED CONVERSION ACTIONS. The account is bidding blind.');\n\nconst callTypes = ['AD_CALL', 'WEBSITE_CALL'];\nconst leadCategories = ['SUBMIT_LEAD_FORM', 'PHONE_CALL_LEAD', 'CONTACT', 'BOOK_APPOINTMENT',\n  'QUALIFIED_LEAD', 'CONVERTED_LEAD', 'REQUEST_QUOTE', 'SIGNUP'];\n\nfor (const a of enabled) {\n  // Firm Media rule: only calls of 60+ seconds count as leads.\n  if (callTypes.includes(a.type) && Number(a.phoneCallDurationSeconds || 0) < cfg.call_min_seconds) {\n    issues.push(`\"${a.name}\" counts calls of ${a.phoneCallDurationSeconds || 0}s+. ` +\n      `Robocalls and hang-ups are being counted as leads. Should be ${cfg.call_min_seconds}s.`);\n    fixes.push({ update: { resourceName: a.resourceName,\n      phoneCallDurationSeconds: String(cfg.call_min_seconds) }, updateMask: 'phoneCallDurationSeconds' });\n    fixSummaries.push(`\"${a.name}\": call length → ${cfg.call_min_seconds}s`);\n  }\n  // One person filling a form twice is one lead, not two.\n  if (leadCategories.includes(a.category) && a.countingType === 'MANY_PER_CLICK') {\n    issues.push(`\"${a.name}\" counts EVERY conversion per click. For leads, one person = one ` +\n      `lead; this inflates conversions and makes CPA look better than it is.`);\n    fixes.push({ update: { resourceName: a.resourceName, countingType: 'ONE_PER_CLICK' },\n      updateMask: 'countingType' });\n    fixSummaries.push(`\"${a.name}\": counting → One per click`);\n  }\n  // Silent tags: a primary action that recorded nothing in 14 days.\n  if (a.primaryForGoal && !recentCount[a.name] && a.type !== 'UPLOAD_CLICKS') {\n    issues.push(`\"${a.name}\" is PRIMARY but recorded 0 conversions in 14 days. The tag may ` +\n      `be broken (check with Google Tag Assistant) — or the campaign truly got no leads.`);\n  }\n}\n\n// Double counting: same lead tracked by the Ads tag AND a GA4 import.\nconst ga4 = primary.filter((a) => (a.type || '').startsWith('GOOGLE_ANALYTICS_4'));\nconst adsTags = primary.filter((a) => a.type === 'WEBPAGE' || a.type === 'WEBPAGE_CODELESS');\nif (ga4.length && adsTags.length) {\n  issues.push(`Possible DOUBLE COUNTING: ${ga4.length} GA4-imported and ${adsTags.length} ` +\n    `Google Ads-tag actions are both PRIMARY. If they track the same form, each lead counts ` +\n    `twice. Keep one as primary and set the other to secondary.`);\n}\n\nif (!enabled.some((a) => a.type === 'AD_CALL')) {\n  issues.push('No \"Calls from ads\" conversion action. Calls from call assets are not being ' +\n    'counted. Create one: Goals > New conversion action > Phone calls > Calls from ads, ' +\n    `${cfg.call_min_seconds}s minimum.`);\n}\n\n// ---------- SETUP: offline lead-stage actions for Workflow 4 ----------\n// These receive uploads from the Lead Evaluation Sheet. Created as\n// SECONDARY so they report revenue without changing how bidding works yet.\nconst stageCategory = { 'Qualified Lead': 'QUALIFIED_LEAD', 'Booked Consult': 'BOOK_APPOINTMENT',\n  'Closed - Revenue': 'CONVERTED_LEAD' };\nconst names = new Set(actions.map((r) => r.conversionAction.name));\nfor (const stage of Object.keys(cfg.stage_to_conversion_action || {})) {\n  const name = `Offline - ${stage}`;\n  if (names.has(name)) { ok.push(`\"${name}\" exists`); continue; }\n  issues.push(`Missing offline stage action \"${name}\" (needed for revenue/ROAS import).`);\n  fixes.push({ create: {\n    name, type: 'UPLOAD_CLICKS', status: 'ENABLED',\n    category: stageCategory[stage] || 'QUALIFIED_LEAD',\n    countingType: 'ONE_PER_CLICK', primaryForGoal: false,\n    clickThroughLookbackWindowDays: '90',   // consult sales cycles are long\n    valueSettings: { defaultValue: 0, alwaysUseDefaultValue: false },\n  } });\n  fixSummaries.push(`Create \"${name}\" (secondary, 90-day window)`);\n}\n\nconst body = [\n  `CONVERSION TRACKING AUDIT — ${cust.descriptiveName || cid}`,\n  '',\n  issues.length ? `ISSUES (${issues.length})` : 'NO ISSUES FOUND',\n  ...issues.map((i) => '• ' + i),\n  '',\n  `Primary actions (what bidding optimizes for): ${primary.map((a) => a.name).join(', ') || 'none'}`,\n  `14-day counts: ${Object.entries(recentCount).map(([k, v]) => `${k}: ${v.toFixed(0)}`).join(' | ') || 'none'}`,\n  '',\n  fixSummaries.length\n    ? (AUTO_FIX ? `FIXES ${cfg.dry_run ? 'VALIDATED (dry run)' : 'APPLIED'}:\\n` : 'FIXES AVAILABLE (set AUTO_FIX = true in the audit node to apply):\\n')\n      + fixSummaries.map((f) => '  - ' + f).join('\\n')\n    : '',\n  '',\n  'After creating the offline actions, copy their IDs into Config > stage_to_conversion_action.',\n].join('\\n');\n\nconst requests = AUTO_FIX && fixes.length ? [{\n  url: `https://googleads.googleapis.com/${cfg.api_version}/customers/${cid}/conversionActions:mutate`,\n  body: { operations: fixes, partialFailure: true, validateOnly: cfg.dry_run === true },\n  endpoint: 'conversionActions:mutate', summaries: fixSummaries,\n}] : [];\n\nreturn [{ json: { subject: `[Conversion Audit] ${issues.length} issue(s)`, body, requests } }];\n"
+      },
+      "id": "3d188ae7-fee8-4628-ae4e-ccdcb366c8d9",
+      "name": "Audit Tracking",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "={{ $('Config').first().json.approver_email }}",
+        "subject": "={{ $json.subject }}",
+        "emailType": "text",
+        "message": "={{ $json.body }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "44032ddf-592a-49a8-9ebc-e3cdb3e70c1f",
+      "name": "Send Audit Report",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1440,
+        300
+      ],
+      "webhookId": "824b4fd9-e0f8-466e-9fd1-ac340b5b8128"
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n//  BUILD API REQUESTS — turns the list of planned requests into one n8n\n//  item per request, so the HTTP node below runs once for each.\n//  If there are no changes, returning [] ends the workflow quietly.\n// =====================================================================\nconst { requests } = $('Audit Tracking').first().json;\nreturn (requests || []).map((r) => ({ json: r }));\n"
+      },
+      "id": "b20c2788-eca2-47d8-83d0-15feffb0c35b",
+      "name": "Build API Requests",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleAdsOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "developer-token",
+              "value": "={{ $('Config').first().json.developer_token }}"
+            },
+            {
+              "name": "login-customer-id",
+              "value": "={{ $('Config').first().json.login_customer_id }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {}
+      },
+      "id": "22572b35-c43b-4838-b37b-28a44c4356f9",
+      "name": "Apply to Google Ads",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1920,
+        300
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n//  LOG RESULTS — one spreadsheet row per change, so you have a full\n//  history of what the system did, when, and whether Google accepted it.\n// =====================================================================\n\nconst cfg = $('Config').first().json;\nconst requests = $('Build API Requests').all();\nconst responses = $input.all();\nconst rows = [];\nconst now = new Date().toISOString();\n\nrequests.forEach((req, i) => {\n  const res = responses[i]?.json || {};\n  const results = res.results || [];\n  const httpError = res.error ? (res.error.message || JSON.stringify(res.error)).slice(0, 300) : '';\n  // With partialFailure, failed operations come back as empty {} results.\n  const pfErrors = (res.partialFailureError?.details || [])\n    .flatMap((d) => d.errors || []).map((e) => e.message);\n\n  req.json.summaries.forEach((summary, j) => {\n    const ok = !httpError && results[j] && Object.keys(results[j]).length > 0;\n    rows.push({ json: {\n      timestamp: now,\n      mode: cfg.dry_run ? 'DRY RUN' : 'LIVE',\n      customer_id: cfg.customer_id,\n      endpoint: req.json.endpoint,\n      change: summary,\n      status: httpError ? 'ERROR' : (ok || cfg.dry_run && !pfErrors.length ? 'OK' : 'FAILED'),\n      detail: httpError || (ok ? (results[j].resourceName || '') : (pfErrors.shift() || '')),\n    } });\n  });\n});\nreturn rows;\n"
+      },
+      "id": "673796e4-24fa-40ef-b73c-85f77788e0c8",
+      "name": "Log Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "url",
+          "value": "={{ $('Config').first().json.sheet_url }}"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "={{ $('Config').first().json.log_sheet_tab }}"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "ce4ccfe0-1479-40a6-b3d5-483bfcf835c3",
+      "name": "Write Change Log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        2400,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Conversion Audit\nEvery bid decision depends on conversions being real. This checks: 60-second call minimum, one-per-click counting for leads, silent tags, GA4 + tag double counting, auto-tagging, enhanced conversions.\n\nIt also **creates the offline lead-stage actions** Workflow 4 needs. Fixes apply only when `AUTO_FIX = true` inside **Audit Tracking**.",
+        "width": 1000,
+        "height": 270,
+        "color": 5
+      },
+      "id": "6b966e1c-f335-4cac-b0f6-316d20d7b751",
+      "name": "Note 012142",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "blue-market-conversion-audit",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "ff3c45be-8acd-4fbd-899e-b7fe17b7c1d7",
+      "name": "Started from App",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        520
+      ],
+      "webhookId": "54679abb-97a6-4d94-a8e6-9d872d7d9805"
+    }
+  ],
+  "connections": {
+    "Mondays 7:20am": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Get Account Settings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Account Settings": {
+      "main": [
+        [
+          {
+            "node": "Get Conversion Actions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Conversion Actions": {
+      "main": [
+        [
+          {
+            "node": "Get Conversions by Action (14d)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Conversions by Action (14d)": {
+      "main": [
+        [
+          {
+            "node": "Audit Tracking",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit Tracking": {
+      "main": [
+        [
+          {
+            "node": "Send Audit Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Audit Report": {
+      "main": [
+        [
+          {
+            "node": "Build API Requests",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build API Requests": {
+      "main": [
+        [
+          {
+            "node": "Apply to Google Ads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply to Google Ads": {
+      "main": [
+        [
+          {
+            "node": "Log Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Log Results": {
+      "main": [
+        [
+          {
+            "node": "Write Change Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Started from App": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Los_Angeles",
+    "saveManualExecutions": true
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
